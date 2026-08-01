@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="interval-seconds" content="5">
+<title>monitor-agent remote</title>
+<style>
+  :root {
+    --bg: #fff5f7;
+    --panel: #ffffff;
+    --border: #f5dbe5;
+    --text: #4a3a42;
+    --muted: #a18893;
+    --accent: #ff8ba7;
+    --accent-strong: #e76f92;
+    --ok: #4caf7d;
+    --warn: #e0a13c;
+    --crit: #e5484d;
+    --unknown: #a18893;
+    --mono: ui-monospace, "Cascadia Mono", "JetBrains Mono", "Fira Code", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 14px;
+    line-height: 1.45;
+  }
+  body { padding: 20px; max-width: 1200px; margin: 0 auto; }
+  header {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 16px;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 16px;
+    margin-bottom: 16px;
+    box-shadow: 0 2px 10px rgba(231, 111, 146, 0.08);
+  }
+  header .brand { display: flex; align-items: center; gap: 10px; }
+  header .brand svg { width: 34px; height: 34px; }
+  header h1 {
+    margin: 0;
+    font-size: 16px;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+    color: var(--accent-strong);
+  }
+  header .rollup { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
+  header .count { display: inline-flex; align-items: center; gap: 6px; }
+  header .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+  header .dot.ok { background: var(--ok); }
+  header .dot.warn { background: var(--warn); }
+  header .dot.crit { background: var(--crit); }
+  header .dot.srv { background: var(--accent); }
+  header .countdown { margin-left: auto; color: var(--muted); font-size: 12px; }
+  .section-title {
+    margin: 18px 0 8px;
+    font-size: 12px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    color: var(--muted);
+  }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+    gap: 12px;
+  }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 14px;
+    cursor: pointer;
+    transition: box-shadow 0.15s ease, border-color 0.15s ease;
+  }
+  .card:hover { box-shadow: 0 4px 16px rgba(231, 111, 146, 0.14); border-color: var(--accent); }
+  .card .top { display: flex; align-items: center; gap: 8px; }
+  .card .name { font-weight: 700; word-break: break-all; }
+  .card .host { color: var(--muted); font-size: 12px; word-break: break-all; }
+  .card .meta { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 10px; font-size: 12px; color: var(--muted); }
+  .card .meta b { color: var(--text); font-weight: 600; }
+  .badge {
+    display: inline-flex; align-items: center; gap: 5px;
+    padding: 2px 8px; border-radius: 999px;
+    font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.4px;
+  }
+  .badge.ok { background: rgba(76, 175, 125, 0.12); color: var(--ok); }
+  .badge.warn { background: rgba(224, 161, 60, 0.14); color: var(--warn); }
+  .badge.critical { background: rgba(229, 72, 77, 0.12); color: var(--crit); }
+  .badge.unknown { background: rgba(161, 136, 147, 0.14); color: var(--unknown); }
+  .group {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    margin-bottom: 12px;
+    overflow: hidden;
+  }
+  .group h2 {
+    margin: 0;
+    padding: 10px 14px;
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--accent-strong);
+    background: rgba(255, 139, 167, 0.07);
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .group h2 .summary { color: var(--muted); font-weight: 400; font-size: 12px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { padding: 6px 14px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--border); }
+  th {
+    font-size: 11px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    font-weight: 600;
+    background: rgba(255, 139, 167, 0.04);
+  }
+  tr:last-child td { border-bottom: none; }
+  td.status { width: 24px; text-align: center; }
+  td.target { word-break: break-all; }
+  td.age { text-align: right; width: 90px; white-space: nowrap; color: var(--muted); }
+  td.message { color: var(--muted); }
+  .glyph { display: inline-block; width: 12px; height: 12px; border-radius: 50%; }
+  .glyph.ok { background: var(--ok); }
+  .glyph.warn { background: var(--warn); }
+  .glyph.critical { background: var(--crit); }
+  .glyph.unknown { background: var(--unknown); }
+  .empty {
+    padding: 18px 14px; text-align: center; color: var(--muted); font-size: 12px;
+  }
+  footer { margin-top: 16px; color: var(--muted); font-size: 11px; text-align: center; }
+  .banner {
+    background: rgba(224, 161, 60, 0.1);
+    border: 1px solid var(--warn);
+    color: var(--warn);
+    padding: 8px 14px;
+    border-radius: 8px;
+    margin-bottom: 12px;
+    font-size: 12px;
+  }
+  .close-btn {
+    background: transparent; border: none; color: var(--muted);
+    font-family: var(--mono); font-size: 14px; cursor: pointer; padding: 0 4px;
+  }
+  .close-btn:hover { color: var(--crit); }
+</style>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <svg viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+        <rect x="0" y="0" width="200" height="200" rx="45" fill="#FFF5F7"/>
+        <path d="M 35 78 A 65 65 0 0 1 165 78" stroke="#FFB7CE" stroke-width="10" fill="none" stroke-linecap="round"/>
+        <path d="M 52 56 A 82 82 0 0 1 148 56" stroke="#FFA6C1" stroke-width="8" fill="none" stroke-linecap="round" opacity="0.7"/>
+        <path d="M 70 36 A 102 102 0 0 1 130 36" stroke="#FF8BAF" stroke-width="6" fill="none" stroke-linecap="round" opacity="0.45"/>
+        <line x1="100" y1="128" x2="100" y2="84" stroke="#444455" stroke-width="5" stroke-linecap="round"/>
+        <circle cx="100" cy="78" r="9" fill="#FF8BAF"/>
+        <circle cx="100" cy="143" r="26" fill="#FFFFFF" stroke="#FFA6C1" stroke-width="4"/>
+        <polyline points="86,143 95,152 115,132" fill="none" stroke="#4ADE80" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      <h1>monitor-agent remote</h1>
+    </div>
+    <div class="rollup">
+      <span class="count"><span class="dot srv"></span><span id="agent-count">0</span> servers</span>
+      <span class="count"><span class="dot crit"></span><span id="alert-count">0</span> alerts</span>
+      <span class="count"><span class="dot warn"></span><span id="warn-count">0</span> warn</span>
+      <span class="count"><span class="dot ok"></span><span id="ok-count">0</span> ok</span>
+    </div>
+    <span class="countdown" id="countdown"></span>
+  </header>
+  <div id="banner"></div>
+
+  <div class="section-title">servers</div>
+  <div id="agents" class="grid"></div>
+
+  <div class="section-title">active alerts</div>
+  <section id="alerts" class="group"></section>
+
+  <div id="agent-panel"></div>
+
+  <footer>remote dashboard · polls every <span id="interval-label">5</span>s</footer>
+
+<script>
+  const INTERVAL = parseInt(
+    document.querySelector('meta[name="interval-seconds"]').getAttribute('content'),
+    10
+  ) || 5;
+  document.getElementById('interval-label').textContent = INTERVAL;
+
+  let currentAgent = null;
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return { '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c];
+    });
+  }
+  function timeAgo(unix) {
+    const delta = Math.max(0, Math.floor(Date.now() / 1000) - unix);
+    if (delta < 60) return delta + 's ago';
+    if (delta < 3600) return Math.floor(delta / 60) + 'm ago';
+    if (delta < 86400) return Math.floor(delta / 3600) + 'h ago';
+    return Math.floor(delta / 86400) + 'd ago';
+  }
+  function statusBadge(status) {
+    const cls = ['ok', 'warn', 'critical', 'unknown'].includes(status) ? status : 'unknown';
+    return '<span class="badge ' + cls + '">' + cls + '</span>';
+  }
+  function glyph(status) {
+    const cls = ['ok', 'warn', 'critical', 'unknown'].includes(status) ? status : 'unknown';
+    return '<span class="glyph ' + cls + '"></span>';
+  }
+
+  function renderAgents(agents) {
+    const grid = document.getElementById('agents');
+    grid.innerHTML = '';
+    agents.forEach(function (a) {
+      const card = document.createElement('div');
+      card.className = 'card';
+      card.innerHTML =
+        '<div class="top">' + statusBadge(a.status) + '<span class="name">' + escapeHtml(a.agent_id) + '</span></div>' +
+        '<div class="host">' + escapeHtml(a.agent_host || '') + '</div>' +
+        '<div class="meta">' +
+          '<span>alerts <b>' + a.active_alerts + '</b></span>' +
+          '<span>ok <b>' + a.ok_count + '</b></span>' +
+          '<span>warn <b>' + a.warn_count + '</b></span>' +
+          '<span>crit <b>' + a.critical_count + '</b></span>' +
+          '<span>seen <b>' + timeAgo(a.last_seen) + '</b></span>' +
+        '</div>';
+      card.addEventListener('click', function () { toggleAgentPanel(a.agent_id); });
+      grid.appendChild(card);
+    });
+    if (agents.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'empty';
+      empty.textContent = 'No agents yet — configure [exporter] in a monitor-agent and point it here.';
+      grid.appendChild(empty);
+    }
+    document.getElementById('agent-count').textContent = agents.length;
+    const warns = agents.filter(function (a) { return a.status === 'warn'; }).length;
+    const criticals = agents.filter(function (a) { return a.status === 'critical'; }).length;
+    const oks = agents.filter(function (a) { return a.status === 'ok'; }).length;
+    document.getElementById('warn-count').textContent = warns;
+    document.getElementById('ok-count').textContent = oks;
+    document.getElementById('alert-count').textContent = criticals;
+  }
+
+  function renderAlerts(alerts) {
+    const section = document.getElementById('alerts');
+    section.innerHTML = '';
+    const h = document.createElement('h2');
+    h.innerHTML = '<span>Active alerts</span><span class="summary">' + alerts.length + ' failing</span>';
+    section.appendChild(h);
+    if (alerts.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'empty';
+      empty.textContent = 'Nothing failing right now ✨';
+      section.appendChild(empty);
+      return;
+    }
+    const table = document.createElement('table');
+    const thead = document.createElement('thead');
+    thead.innerHTML = '<tr><th></th><th>server</th><th>check</th><th>target</th><th>message</th><th style="text-align:right">age</th></tr>';
+    table.appendChild(thead);
+    const tbody = document.createElement('tbody');
+    alerts.forEach(function (a) {
+      const tr = document.createElement('tr');
+      tr.innerHTML =
+        '<td class="status">' + glyph(a.status) + '</td>' +
+        '<td class="target"><b>' + escapeHtml(a.agent_id) + '</b></td>' +
+        '<td>' + escapeHtml(a.check_type) + '</td>' +
+        '<td class="target">' + escapeHtml(a.target) + '</td>' +
+        '<td class="message">' + escapeHtml(a.message) + '</td>' +
+        '<td class="age">' + timeAgo(a.ts) + '</td>';
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    section.appendChild(table);
+    document.getElementById('alert-count').textContent = alerts.filter(function (a) { return a.status === 'critical'; }).length;
+  }
+
+  async function toggleAgentPanel(agentId) {
+    if (currentAgent === agentId) {
+      currentAgent = null;
+      document.getElementById('agent-panel').innerHTML = '';
+      return;
+    }
+    currentAgent = agentId;
+    const panel = document.getElementById('agent-panel');
+    panel.innerHTML = '<div class="group"><h2><span>…</span></h2></div>';
+    try {
+      const res = await fetch('/api/agents/' + encodeURIComponent(agentId) + '/events?limit=50', { cache: 'no-store' });
+      if (!res.ok) throw new Error('status ' + res.status);
+      const events = await res.json();
+      const group = document.createElement('div');
+      group.className = 'group';
+      const h = document.createElement('h2');
+      h.innerHTML = '<span>Recent events · ' + escapeHtml(agentId) + '</span><button class="close-btn" title="close">✕</button>';
+      h.querySelector('.close-btn').addEventListener('click', function () { currentAgent = null; panel.innerHTML = ''; });
+      group.appendChild(h);
+      if (events.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'empty';
+        empty.textContent = 'No events yet.';
+        group.appendChild(empty);
+      } else {
+        const table = document.createElement('table');
+        const thead = document.createElement('thead');
+        thead.innerHTML = '<tr><th></th><th>event</th><th>check</th><th>target</th><th>message</th><th style="text-align:right">age</th></tr>';
+        table.appendChild(thead);
+        const tbody = document.createElement('tbody');
+        events.forEach(function (e) {
+          const tr = document.createElement('tr');
+          tr.innerHTML =
+            '<td class="status">' + glyph(e.status) + '</td>' +
+            '<td><b>' + escapeHtml(e.event) + '</b></td>' +
+            '<td>' + escapeHtml(e.check_type) + '</td>' +
+            '<td class="target">' + escapeHtml(e.target) + '</td>' +
+            '<td class="message">' + escapeHtml(e.message) + '</td>' +
+            '<td class="age">' + timeAgo(e.ts) + '</td>';
+          tbody.appendChild(tr);
+        });
+        table.appendChild(tbody);
+        group.appendChild(table);
+      }
+      panel.innerHTML = '';
+      panel.appendChild(group);
+    } catch (err) {
+      panel.innerHTML = '<div class="group"><h2><span>Recent events · ' + escapeHtml(agentId) + '</span></h2><div class="empty">failed: ' + escapeHtml(String(err)) + '</div></div>';
+      currentAgent = null;
+    }
+  }
+
+  async function refresh() {
+    try {
+      const agentsRes = await fetch('/api/agents', { cache: 'no-store' });
+      if (!agentsRes.ok) {
+        document.getElementById('banner').textContent = 'server returned ' + agentsRes.status;
+        return;
+      }
+      const alertsRes = await fetch('/api/alerts', { cache: 'no-store' });
+      if (!alertsRes.ok) {
+        document.getElementById('banner').textContent = 'server returned ' + alertsRes.status;
+        return;
+      }
+      const agents = await agentsRes.json();
+      const alerts = await alertsRes.json();
+      renderAgents(agents);
+      renderAlerts(alerts);
+      document.getElementById('banner').textContent = '';
+      if (currentAgent) {
+        toggleAgentPanel(currentAgent);
+      }
+    } catch (err) {
+      document.getElementById('banner').textContent = 'fetch failed: ' + err;
+    }
+  }
+
+  refresh();
+  setInterval(refresh, INTERVAL * 1000);
+</script>
+</body>
+</html>

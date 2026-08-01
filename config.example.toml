@@ -1,0 +1,11 @@
+# monitor-agent-remote — receptor de avisos de monitor-agent
+# Dirección del panel web y del endpoint /api/ingest.
+# Usa 0.0.0.0:9600 para acceder desde la red local.
+listen = "127.0.0.1:9600"
+
+# Archivo SQLite donde se guardan agentes y eventos.
+db_path = "monitor.db"
+
+# Token opcional: si lo defines, los exporters deben enviar
+# "Authorization: Bearer <token>" en cada petición a /api/ingest.
+#token = "CAMBIAME"

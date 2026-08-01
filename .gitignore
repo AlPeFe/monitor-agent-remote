@@ -1,0 +1,7 @@
+/target
+/config.toml
+/monitor.db
+/monitor.db-journal
+/monitor.db-wal
+/monitor.db-shm
+*.log
