@@ -249,6 +249,19 @@ footer { margin-top: 18px; color: var(--muted); font-size: 11.5px; text-align: c
   *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
 }
 
+
+.panel-body { padding: 4px 0 8px; }
+.panel-sub {
+  display: flex; align-items: baseline; justify-content: space-between;
+  padding: 12px 16px 4px; font-size: 10.5px; font-weight: 800;
+  text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted);
+}
+.panel-sub .summary { text-transform: none; letter-spacing: 0; font-weight: 600; }
+.panel-sub .muted { color: var(--muted); }
+b.ev { font-weight: 800; }
+b.ev.ok { color: var(--ok-text); }
+b.ev.warn { color: var(--warn-text); }
+b.ev.crit { color: var(--crit-text); }
 </style>
 </head>
 <body>
@@ -424,37 +437,82 @@ footer { margin-top: 18px; color: var(--muted); font-size: 11.5px; text-align: c
   }
 
   // Fuerza la apertura/actualización del panel de un agente (no alterna).
+  // Vista uptime-kuma: estado actual por check + incidencias recientes
+  // (solo fails/recovers; los heartbeats no se guardan como eventos).
   async function openAgentPanel(agentId) {
     if (!agentId) return;
     currentAgent = agentId;
     const panel = document.getElementById('agent-panel');
     panel.innerHTML = '<div class="group"><h2><span>…</span></h2></div>';
     try {
-      const res = await fetch('/api/agents/' + encodeURIComponent(agentId) + '/events?limit=50', { cache: 'no-store' });
-      if (!res.ok) throw new Error('status ' + res.status);
-      const events = await res.json();
+      const [checksRes, eventsRes] = await Promise.all([
+        fetch('/api/agents/' + encodeURIComponent(agentId) + '/checks', { cache: 'no-store' }),
+        fetch('/api/agents/' + encodeURIComponent(agentId) + '/events?limit=25', { cache: 'no-store' })
+      ]);
+      if (!checksRes.ok || !eventsRes.ok) throw new Error('status ' + checksRes.status);
+      const checks = await checksRes.json();
+      const events = await eventsRes.json();
       const group = document.createElement('div');
       group.className = 'group';
       const h = document.createElement('h2');
-      h.innerHTML = '<span>Recent events · ' + escapeHtml(agentId) + '</span><button class="close-btn" title="close">✕</button>';
+      h.innerHTML = '<span>Detalle · ' + escapeHtml(agentId) + '</span><span class="summary">' + checks.length + ' checks</span><button class="close-btn" title="close">✕</button>';
       h.querySelector('.close-btn').addEventListener('click', function () { closeAgentPanel(); });
       group.appendChild(h);
-      if (events.length === 0) {
+      const body = document.createElement('div');
+      body.className = 'panel-body';
+
+      // Estado actual por check
+      const chTitle = document.createElement('div');
+      chTitle.className = 'panel-sub';
+      chTitle.innerHTML = '<span class="pm">Estado actual</span>';
+      body.appendChild(chTitle);
+      if (checks.length === 0) {
         const empty = document.createElement('div');
         empty.className = 'empty';
-        empty.textContent = 'No events yet.';
-        group.appendChild(empty);
+        empty.textContent = 'No hay checks todavia: espera al primer heartbeat del agente.';
+        body.appendChild(empty);
       } else {
         const table = document.createElement('table');
         const thead = document.createElement('thead');
-        thead.innerHTML = '<tr><th></th><th>event</th><th>check</th><th>target</th><th>message</th><th style="text-align:right">age</th></tr>';
+        thead.innerHTML = '<tr><th></th><th>check</th><th>destino</th><th>mensaje</th><th style="text-align:right">hace</th></tr>';
+        table.appendChild(thead);
+        const tbody = document.createElement('tbody');
+        checks.forEach(function (c) {
+          const tr = document.createElement('tr');
+          tr.innerHTML =
+            '<td class="status">' + glyph(c.status) + '</td>' +
+            '<td>' + escapeHtml(c.check_type) + '</td>' +
+            '<td class="target">' + escapeHtml(c.target) + '</td>' +
+            '<td class="message">' + escapeHtml(c.message) + '</td>' +
+            '<td class="age">' + timeAgo(c.ts) + '</td>';
+          tbody.appendChild(tr);
+        });
+        table.appendChild(tbody);
+        body.appendChild(table);
+      }
+
+      // Incidencias recientes (fail/recover)
+      const evTitle = document.createElement('div');
+      evTitle.className = 'panel-sub';
+      evTitle.innerHTML = '<span class="pm">Incidencias recientes</span><span class="summary muted">' + events.length + ' (fail/recover)</span>';
+      body.appendChild(evTitle);
+      if (events.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'empty';
+        empty.textContent = 'Sin incidencias en el historial reciente.';
+        body.appendChild(empty);
+      } else {
+        const table = document.createElement('table');
+        const thead = document.createElement('thead');
+        thead.innerHTML = '<tr><th></th><th>event</th><th>check</th><th>destino</th><th>mensaje</th><th style="text-align:right">hace</th></tr>';
         table.appendChild(thead);
         const tbody = document.createElement('tbody');
         events.forEach(function (e) {
           const tr = document.createElement('tr');
+          const cls = e.event === 'fail' ? (e.status === 'critical' ? 'crit' : 'warn') : 'ok';
           tr.innerHTML =
             '<td class="status">' + glyph(e.status) + '</td>' +
-            '<td><b>' + escapeHtml(e.event) + '</b></td>' +
+            '<td><b class="ev ' + cls + '">' + escapeHtml(e.event) + '</b></td>' +
             '<td>' + escapeHtml(e.check_type) + '</td>' +
             '<td class="target">' + escapeHtml(e.target) + '</td>' +
             '<td class="message">' + escapeHtml(e.message) + '</td>' +
@@ -462,12 +520,14 @@ footer { margin-top: 18px; color: var(--muted); font-size: 11.5px; text-align: c
           tbody.appendChild(tr);
         });
         table.appendChild(tbody);
-        group.appendChild(table);
+        body.appendChild(table);
       }
+
+      group.appendChild(body);
       panel.innerHTML = '';
       panel.appendChild(group);
     } catch (err) {
-      panel.innerHTML = '<div class="group"><h2><span>Recent events · ' + escapeHtml(agentId) + '</span></h2><div class="empty">failed: ' + escapeHtml(String(err)) + '</div></div>';
+      panel.innerHTML = '<div class="group"><h2><span>Detalle · ' + escapeHtml(agentId) + '</span></h2><div class="empty">failed: ' + escapeHtml(String(err)) + '</div></div>';
       currentAgent = null;
     }
   }

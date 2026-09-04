@@ -57,6 +57,18 @@ pub struct Database {
     conn: Connection,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentCheck {
+    pub agent_id: String,
+    pub check_type: String,
+    pub target: String,
+    pub status: String,
+    pub message: String,
+    pub value: Option<f64>,
+    pub last_event: String,
+    pub ts: i64,
+}
+
 impl Database {
     pub fn open(path: &str) -> rusqlite::Result<Self> {
         let conn = Connection::open(path)?;
@@ -91,6 +103,18 @@ impl Database {
              CREATE INDEX IF NOT EXISTS idx_events_agent_id ON events(agent_id, id DESC);
              CREATE INDEX IF NOT EXISTS idx_events_recent   ON events(id DESC);
              CREATE INDEX IF NOT EXISTS idx_events_active   ON events(agent_id, event, check_type, target);
+
+             CREATE TABLE IF NOT EXISTS agent_checks (
+               agent_id   TEXT NOT NULL,
+               check_type TEXT NOT NULL,
+               target     TEXT NOT NULL,
+               status     TEXT NOT NULL DEFAULT 'unknown',
+               message    TEXT NOT NULL DEFAULT '',
+               value      REAL,
+               last_event TEXT NOT NULL DEFAULT '',
+               ts         INTEGER NOT NULL,
+               PRIMARY KEY (agent_id, check_type, target)
+             );
 
              CREATE TABLE IF NOT EXISTS settings (
                key    TEXT PRIMARY KEY,
@@ -134,21 +158,27 @@ impl Database {
             p.status.trim()
         };
 
-        self.conn.execute(
-            "INSERT INTO events (agent_id, event, check_type, target, status, message, value, ts, received_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                p.agent_id,
-                p.event,
-                p.check_type,
-                p.target,
-                status,
-                p.message,
-                p.value,
-                ts,
-                now
-            ],
-        )?;
+        // Retención: los heartbeats NO se guardan como eventos (solo actualizan
+        // el estado agregado del agente). La tabla events conserva fails y
+        // recovers, que es donde está la historia que importa.
+        let is_heartbeat = p.event == "heartbeat";
+        if !is_heartbeat {
+            self.conn.execute(
+                "INSERT INTO events (agent_id, event, check_type, target, status, message, value, ts, received_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    p.agent_id,
+                    p.event,
+                    p.check_type,
+                    p.target,
+                    status,
+                    p.message,
+                    p.value,
+                    ts,
+                    now
+                ],
+            )?;
+        }
         let id = self.conn.last_insert_rowid();
 
         let host = p.agent_host.as_deref().unwrap_or("");
@@ -186,6 +216,18 @@ impl Database {
                      WHERE agent_id = ?2",
                     params![status, p.agent_id],
                 )?;
+                // Estado actual por check (vista uptime-kuma).
+                self.conn.execute(
+                    "INSERT INTO agent_checks (agent_id, check_type, target, status, message, value, last_event, ts)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'fail', ?7)
+                     ON CONFLICT(agent_id, check_type, target) DO UPDATE SET
+                       status = excluded.status,
+                       message = excluded.message,
+                       value = excluded.value,
+                       last_event = 'fail',
+                       ts = excluded.ts",
+                    params![p.agent_id, p.check_type, p.target, status, p.message, p.value, ts],
+                )?;
             }
             "recover" => {
                 // Si ya no quedan avisos activos para el agente, vuelve a ok.
@@ -196,6 +238,18 @@ impl Database {
                         params![p.agent_id],
                     )?;
                 }
+                // El check recuperado queda en ok (estado actual por check).
+                self.conn.execute(
+                    "INSERT INTO agent_checks (agent_id, check_type, target, status, message, value, last_event, ts)
+                     VALUES (?1, ?2, ?3, 'ok', ?4, ?5, 'recover', ?6)
+                     ON CONFLICT(agent_id, check_type, target) DO UPDATE SET
+                       status = 'ok',
+                       message = excluded.message,
+                       value = excluded.value,
+                       last_event = 'recover',
+                       ts = excluded.ts",
+                    params![p.agent_id, p.check_type, p.target, p.message, p.value, ts],
+                )?;
             }
             _ => {} // otros eventos (p.ej. "ok") solo se almacenan
         }
@@ -266,12 +320,52 @@ impl Database {
 
     pub fn agent_events(&self, agent_id: &str, limit: i64) -> rusqlite::Result<Vec<EventRow>> {
         let mut stmt = self.conn.prepare(
+            // Por defecto se omiten los heartbeats (ruido): el historial útil son
+            // fails/recovers. La retención de eventos ya no guarda heartbeats.
             "SELECT id, agent_id, event, check_type, target, status, message, value, ts, received_at
-             FROM events WHERE agent_id = ?1
+             FROM events WHERE agent_id = ?1 AND event <> 'heartbeat'
              ORDER BY id DESC LIMIT ?2",
         )?;
         let rows = stmt
-            .query_map(params![agent_id, limit], map_event_row)?
+            .query_map(params![agent_id, limit], |row| {
+                Ok(EventRow {
+                    id: row.get(0)?,
+                    agent_id: row.get(1)?,
+                    event: row.get(2)?,
+                    check_type: row.get(3)?,
+                    target: row.get(4)?,
+                    status: row.get(5)?,
+                    message: row.get(6)?,
+                    value: row.get(7)?,
+                    ts: row.get(8)?,
+                    received_at: row.get(9)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Estado actual por check del agente (vista uptime-kuma: una fila por
+    /// monitor con su último estado, sin el ruido de eventos repetidos).
+    pub fn list_agent_checks(&self, agent_id: &str) -> rusqlite::Result<Vec<AgentCheck>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT agent_id, check_type, target, status, message, value, last_event, ts
+             FROM agent_checks WHERE agent_id = ?1
+             ORDER BY check_type, target",
+        )?;
+        let rows = stmt
+            .query_map(params![agent_id], |row| {
+                Ok(AgentCheck {
+                    agent_id: row.get(0)?,
+                    check_type: row.get(1)?,
+                    target: row.get(2)?,
+                    status: row.get(3)?,
+                    message: row.get(4)?,
+                    value: row.get(5)?,
+                    last_event: row.get(6)?,
+                    ts: row.get(7)?,
+                })
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }

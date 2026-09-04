@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex, RwLock, watch};
 
 use crate::config::Settings;
-use crate::db::{AgentRow, Database, EventRow, IngestPayload};
+use crate::db::{AgentCheck, AgentRow, Database, EventRow, IngestPayload};
 
 const INDEX_HTML: &str = include_str!("../web/index.html");
 
@@ -54,6 +54,7 @@ pub fn router(
         .route("/api/ingest", post(ingest_handler))
         .route("/api/agents", get(agents_handler))
         .route("/api/agents/{agent_id}/events", get(agent_events_handler))
+        .route("/api/agents/{agent_id}/checks", get(agent_checks_handler))
         .route("/api/alerts", get(alerts_handler))
         .route("/api/settings", get(get_settings_handler).put(update_settings_handler))
         .with_state(ApiState {
@@ -124,7 +125,7 @@ async fn agents_handler(State(state): State<ApiState>) -> Result<Json<Vec<AgentR
     })
 }
 
-/// GET /api/agents/{agent_id}/events?limit=50 — historial de un servidor.
+/// GET /api/agents/{agent_id}/checks?limit=50 — historial de un servidor.
 async fn agent_events_handler(
     State(state): State<ApiState>,
     Path(agent_id): Path<String>,
@@ -134,6 +135,18 @@ async fn agent_events_handler(
     let db = state.db.lock().await;
     db.agent_events(&agent_id, limit).map(Json).map_err(|e| {
         eprintln!("monitor-agent-remote: agent events failed: {e}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
+}
+
+/// GET /api/agents/{id}/checks — estado actual por check (uptime-kuma style).
+async fn agent_checks_handler(
+    State(state): State<ApiState>,
+    Path(agent_id): Path<String>,
+) -> Result<Json<Vec<AgentCheck>>, StatusCode> {
+    let db = state.db.lock().await;
+    db.list_agent_checks(&agent_id).map(Json).map_err(|e| {
+        eprintln!("monitor-agent-remote: agent checks failed: {e}");
         StatusCode::INTERNAL_SERVER_ERROR
     })
 }
