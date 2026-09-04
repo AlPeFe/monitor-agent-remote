@@ -282,7 +282,6 @@ b.ev.crit { color: var(--crit-text); }
     <div class="rollup">
       <span class="stat"><span class="dot srv"></span><b id="agent-count">0</b><span class="lbl">servidores</span></span>
       <span class="stat"><span class="dot crit"></span><b id="alert-count">0</b><span class="lbl">incidencias</span></span>
-      <span class="stat"><span class="dot warn"></span><b id="warn-count">0</b><span class="lbl">warn</span></span>
       <span class="stat"><span class="dot ok live"></span><b id="ok-count">0</b><span class="lbl">ok</span></span>
     </div>
     <span class="countdown" id="countdown"></span>
@@ -380,7 +379,6 @@ b.ev.crit { color: var(--crit-text); }
         '<div class="meta">' +
           '<span>incidencias <b>' + a.active_alerts + '</b></span>' +
           '<span>ok <b>' + a.ok_count + '</b></span>' +
-          '<span>warn <b>' + a.warn_count + '</b></span>' +
           '<span>crit <b>' + a.critical_count + '</b></span>' +
           '<span>visto <b>' + timeAgo(a.last_seen) + '</b></span>' +
         '</div>';
@@ -394,13 +392,9 @@ b.ev.crit { color: var(--crit-text); }
       grid.appendChild(empty);
     }
     document.getElementById('agent-count').textContent = agents.length;
-    const warns = agents.filter(function (a) { return a.status === 'warn'; }).length;
-    const criticals = agents.filter(function (a) { return a.status === 'critical'; }).length;
     const oks = agents.filter(function (a) { return a.status === 'ok'; }).length;
-    document.getElementById('warn-count').textContent = warns;
     document.getElementById('ok-count').textContent = oks;
     // 'incidencias' se rellena en renderAlerts con los fails activos reales.
-    void criticals;
   }
 
   function renderAlerts(alerts) {
