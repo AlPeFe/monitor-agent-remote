@@ -29,20 +29,35 @@ con el mismo estilo rosa pastel que el agente.
 Requisitos: **Rust 1.96+**.
 
 ```powershell
-Copy-Item config.example.toml config.toml
 cargo run --release
 ```
 
-Abre `http://127.0.0.1:9600` (cambia `listen` a `0.0.0.0:9600` para acceder desde
-la red). El primer aviso que reciba crea automáticamente el servidor en la vista.
+Abre `http://127.0.0.1:9600`. La configuración (dirección de escucha, token y
+URL de ingest) se gestiona desde la **rueda de ajustes** de la web y se guarda
+en SQLite: no hace falta tocar ficheros de configuración. Para que los agentes
+de la red local puedan avisar, cambia `listen` a `0.0.0.0:9600` en el panel de
+ajustes (se aplica al instante, sin reiniciar).
 
 ## Configuracion
 
+Toda la configuración se hace desde la UI (panel de ajustes) y se persiste en
+SQLite, así que el `config.toml` es **opcional** y solo sirve para fijar la
+ruta de la base de datos antes del primer arranque:
+
 ```toml
-listen = "127.0.0.1:9600"   # panel + API (0.0.0.0 para red local)
-db_path = "monitor.db"       # base SQLite
-#token = "CAMBIAME"          # opcional: exige Authorization: Bearer <token>
+#db_path = "monitor.db"   # ruta SQLite (solo se lee la primera vez)
+#listen  = "0.0.0.0:9600" # semilla inicial opcional
+#token   = "CAMBIAME"     # semilla inicial opcional
 ```
+
+Campos gestionables desde la web:
+
+| Campo         | Descripcion                                                                 |
+|---------------|-----------------------------------------------------------------------------|
+| `listen`      | Dirección del panel + API. Se aplica en vivo (rebind) sin reiniciar.        |
+| `token`       | Opcional. Si se define, `/api/ingest` exige `Authorization: Bearer <token>`.|
+| `db_path`     | Solo lectura (elegida antes del primer arranque).                           |
+| `ingest_url`  | URL que deben apuntar los `[exporter]` de los agentes.                      |
 
 ## Contrato del webhook
 
@@ -89,6 +104,8 @@ Respuesta: `200 {"ok": true, "stored": 42, "agent_id": "server-web-01"}`.
 | GET    | `/api/agents`                 | Estado agregado de todos los servidores. |
 | GET    | `/api/agents/{id}/events`     | Historial de eventos de un servidor.     |
 | GET    | `/api/alerts`                 | Avisos activos (fail sin recover).       |
+| GET    | `/api/settings`               | Config actual (listen, token, db_path, ingest_url). |
+| PUT    | `/api/settings`               | Guarda `listen` y `token` (aplica en vivo). |
 
 Si defines `token` en la configuracion, `/api/ingest` exige la cabecera
 `Authorization: Bearer <token>`.

@@ -1,11 +1,16 @@
-# monitor-agent-remote — receptor de avisos de monitor-agent
-# Dirección del panel web y del endpoint /api/ingest.
-# Usa 0.0.0.0:9600 para acceder desde la red local.
-listen = "127.0.0.1:9600"
+# monitor-agent-remote — configuración de arranque (OPCIONAL).
+#
+# Sin este fichero la app arranca igualmente: base de datos en ./monitor.db,
+# escuchando en 127.0.0.1:9600 y sin token.
+#
+# listen y token se gestionan desde el panel de ajustes de la web (rueda de
+# arriba a la derecha) y se guardan en SQLite. Aquí solo dejas lo que quieras
+# fijar ANTES del primer arranque.
 
-# Archivo SQLite donde se guardan agentes y eventos.
-db_path = "monitor.db"
+# Ruta del archivo SQLite donde se guardan agentes, eventos y configuración.
+# Solo se tiene en cuenta la primera vez (antes de que exista la base).
+#db_path = "monitor.db"
 
-# Token opcional: si lo defines, los exporters deben enviar
-# "Authorization: Bearer <token>" en cada petición a /api/ingest.
+# Semillas opcionales para el primer arranque. Después se cambian desde la UI.
+#listen = "0.0.0.0:9600"   # 0.0.0.0 para aceptar agentes de la red local
 #token = "CAMBIAME"

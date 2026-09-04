@@ -90,9 +90,38 @@ impl Database {
 
              CREATE INDEX IF NOT EXISTS idx_events_agent_id ON events(agent_id, id DESC);
              CREATE INDEX IF NOT EXISTS idx_events_recent   ON events(id DESC);
-             CREATE INDEX IF NOT EXISTS idx_events_active   ON events(agent_id, event, check_type, target);",
+             CREATE INDEX IF NOT EXISTS idx_events_active   ON events(agent_id, event, check_type, target);
+
+             CREATE TABLE IF NOT EXISTS settings (
+               key    TEXT PRIMARY KEY,
+               listen TEXT NOT NULL,
+               token  TEXT
+             );",
         )?;
         Ok(Self { conn })
+    }
+
+    /// Lee la configuración persistida (fila única 'default').
+    pub fn get_settings(&self) -> rusqlite::Result<Option<(String, Option<String>)>> {
+        self.conn
+            .query_row(
+                "SELECT listen, token FROM settings WHERE key = 'default'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+    }
+
+    /// Guarda la configuración. `token = None` desactiva la autenticación.
+    pub fn set_settings(&mut self, listen: &str, token: Option<&str>) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO settings (key, listen, token) VALUES ('default', ?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET
+               listen = excluded.listen,
+               token  = excluded.token",
+            params![listen, token],
+        )?;
+        Ok(())
     }
 
     /// Inserta el evento y actualiza el estado agregado del agente.
@@ -363,6 +392,24 @@ mod tests {
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].last_seen, now_unix());
         assert!(agents[0].first_seen > 0);
+    }
+
+    #[test]
+    fn settings_roundtrip() {
+        let mut db = Database::open(":memory:").expect("open memory db");
+        assert!(db.get_settings().expect("read").is_none());
+
+        db.set_settings("0.0.0.0:9600", Some("s3cret"))
+            .expect("set");
+        let (listen, token) = db.get_settings().expect("read").unwrap();
+        assert_eq!(listen, "0.0.0.0:9600");
+        assert_eq!(token.as_deref(), Some("s3cret"));
+
+        // actualizar: token a None (desactiva auth), listen cambia
+        db.set_settings("127.0.0.1:9601", None).expect("update");
+        let (listen, token) = db.get_settings().expect("read").unwrap();
+        assert_eq!(listen, "127.0.0.1:9601");
+        assert_eq!(token, None);
     }
 
     #[test]

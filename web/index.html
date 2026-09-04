@@ -154,6 +154,43 @@
     font-family: var(--mono); font-size: 14px; cursor: pointer; padding: 0 4px;
   }
   .close-btn:hover { color: var(--crit); }
+  .settings-toggle {
+    background: transparent; border: none; cursor: pointer;
+    color: var(--muted); padding: 4px; display: inline-flex;
+    align-items: center; justify-content: center;
+  }
+  .settings-toggle:hover { color: var(--accent-strong); }
+  .settings-toggle svg { width: 18px; height: 18px; }
+  .settings-body { padding: 12px 14px; }
+  .settings-body .field { margin-bottom: 14px; }
+  .settings-body label {
+    display: block; font-size: 11px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: 0.6px; color: var(--muted); margin-bottom: 5px;
+  }
+  .settings-body label span { text-transform: none; letter-spacing: 0; font-weight: 400; }
+  .settings-body input[type="text"] {
+    width: 100%; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px;
+    background: #fff; color: var(--text); font-family: var(--mono); font-size: 13px;
+  }
+  .settings-body input[type="text"]:focus { outline: none; border-color: var(--accent); }
+  .settings-body .ingest-row { display: flex; gap: 8px; align-items: center; }
+  .settings-body .ingest-row input { flex: 1; }
+  .btn {
+    background: transparent; border: 1px solid var(--border); color: var(--accent-strong);
+    padding: 7px 12px; border-radius: 8px; cursor: pointer;
+    font-family: var(--mono); font-size: 12px; font-weight: 600; white-space: nowrap;
+  }
+  .btn:hover { border-color: var(--accent); background: rgba(255, 139, 167, 0.06); }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .btn.primary:hover { background: var(--accent-strong); border-color: var(--accent-strong); }
+  .btn:disabled { opacity: 0.55; cursor: default; }
+  .settings-body .hint { margin: 5px 0 0; font-size: 11px; color: var(--muted); }
+  .settings-body code {
+    background: rgba(255, 139, 167, 0.1); padding: 1px 5px; border-radius: 5px; font-size: 11px;
+  }
+  .settings-body .mono { font-size: 13px; color: var(--text); word-break: break-all; }
+  .settings-body .actions { display: flex; align-items: center; gap: 10px; margin-top: 4px; flex-wrap: wrap; }
+  .settings-body .copied { font-size: 11px; color: var(--ok); }
 </style>
 </head>
 <body>
@@ -178,8 +215,47 @@
       <span class="count"><span class="dot ok"></span><span id="ok-count">0</span> ok</span>
     </div>
     <span class="countdown" id="countdown"></span>
+    <button class="settings-toggle" id="settings-toggle" title="settings" aria-label="settings">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="3"/>
+        <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+      </svg>
+    </button>
   </header>
   <div id="banner"></div>
+
+  <div id="settings" class="group" style="display:none">
+    <h2><span>settings</span><button class="close-btn" id="settings-close" title="close">✕</button></h2>
+    <div class="settings-body">
+      <div class="field">
+        <label>ingest url</label>
+        <div class="ingest-row">
+          <input id="cfg-ingest" type="text" readonly>
+          <button class="btn" id="cfg-copy">copy</button>
+          <span class="copied" id="cfg-copied"></span>
+        </div>
+        <p class="hint">Point each monitor-agent's <code>[exporter]</code> here.</p>
+      </div>
+      <div class="field">
+        <label>listen address</label>
+        <input id="cfg-listen" type="text" placeholder="127.0.0.1:9600">
+        <p class="hint">Use <code>0.0.0.0:9600</code> to accept agents from the local network. Applies live.</p>
+      </div>
+      <div class="field">
+        <label>auth token <span>(optional)</span></label>
+        <input id="cfg-token" type="text" placeholder="empty = no auth">
+        <p class="hint">If set, <code>/api/ingest</code> requires <code>Authorization: Bearer &lt;token&gt;</code>.</p>
+      </div>
+      <div class="field">
+        <label>database</label>
+        <span class="mono" id="cfg-dbpath"></span>
+      </div>
+      <div class="actions">
+        <button class="btn primary" id="cfg-save">save</button>
+        <span class="hint">token applies immediately</span>
+      </div>
+    </div>
+  </div>
 
   <div class="section-title">servers</div>
   <div id="agents" class="grid"></div>
@@ -289,12 +365,9 @@
     document.getElementById('alert-count').textContent = alerts.filter(function (a) { return a.status === 'critical'; }).length;
   }
 
-  async function toggleAgentPanel(agentId) {
-    if (currentAgent === agentId) {
-      currentAgent = null;
-      document.getElementById('agent-panel').innerHTML = '';
-      return;
-    }
+  // Fuerza la apertura/actualización del panel de un agente (no alterna).
+  async function openAgentPanel(agentId) {
+    if (!agentId) return;
     currentAgent = agentId;
     const panel = document.getElementById('agent-panel');
     panel.innerHTML = '<div class="group"><h2><span>…</span></h2></div>';
@@ -306,7 +379,7 @@
       group.className = 'group';
       const h = document.createElement('h2');
       h.innerHTML = '<span>Recent events · ' + escapeHtml(agentId) + '</span><button class="close-btn" title="close">✕</button>';
-      h.querySelector('.close-btn').addEventListener('click', function () { currentAgent = null; panel.innerHTML = ''; });
+      h.querySelector('.close-btn').addEventListener('click', function () { closeAgentPanel(); });
       group.appendChild(h);
       if (events.length === 0) {
         const empty = document.createElement('div');
@@ -341,6 +414,19 @@
     }
   }
 
+  function closeAgentPanel() {
+    currentAgent = null;
+    document.getElementById('agent-panel').innerHTML = '';
+  }
+
+  function toggleAgentPanel(agentId) {
+    if (currentAgent === agentId) {
+      closeAgentPanel();
+      return;
+    }
+    openAgentPanel(agentId);
+  }
+
   async function refresh() {
     try {
       const agentsRes = await fetch('/api/agents', { cache: 'no-store' });
@@ -359,12 +445,68 @@
       renderAlerts(alerts);
       document.getElementById('banner').textContent = '';
       if (currentAgent) {
-        toggleAgentPanel(currentAgent);
+        // Reabre (sin alternar) el panel del agente que estaba visible.
+        openAgentPanel(currentAgent);
       }
     } catch (err) {
       document.getElementById('banner').textContent = 'fetch failed: ' + err;
     }
   }
+
+  var settingsOpen = false;
+  function setBanner(msg) { document.getElementById('banner').textContent = msg || ''; }
+  function toggleSettings() {
+    settingsOpen = !settingsOpen;
+    var el = document.getElementById('settings');
+    el.style.display = settingsOpen ? 'block' : 'none';
+    if (settingsOpen) loadSettings();
+  }
+  async function loadSettings() {
+    try {
+      var res = await fetch('/api/settings', { cache: 'no-store' });
+      if (!res.ok) { setBanner('settings ' + res.status); return; }
+      var s = await res.json();
+      document.getElementById('cfg-listen').value = s.listen;
+      document.getElementById('cfg-token').value = s.token || '';
+      document.getElementById('cfg-ingest').value = s.ingest_url;
+      document.getElementById('cfg-dbpath').textContent = s.db_path;
+    } catch (e) { setBanner('settings fetch failed: ' + e); }
+  }
+  async function saveSettings() {
+    var listen = document.getElementById('cfg-listen').value.trim();
+    var token = document.getElementById('cfg-token').value;
+    var btn = document.getElementById('cfg-save');
+    btn.disabled = true; btn.textContent = 'saving…';
+    try {
+      var res = await fetch('/api/settings', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ listen: listen, token: token }),
+      });
+      var data = await res.json();
+      if (!res.ok || !data.ok) {
+        setBanner('save failed: ' + (data.error || res.status));
+      } else {
+        setBanner('settings saved');
+        loadSettings();
+      }
+    } catch (e) {
+      setBanner('save failed: ' + e);
+    }
+    btn.disabled = false; btn.textContent = 'save';
+  }
+  function copyIngest() {
+    var v = document.getElementById('cfg-ingest').value;
+    navigator.clipboard.writeText(v).then(function () {
+      var c = document.getElementById('cfg-copied');
+      c.textContent = 'copied';
+      setTimeout(function () { c.textContent = ''; }, 1500);
+    }).catch(function () { setBanner('copy failed'); });
+  }
+  document.getElementById('settings-toggle').addEventListener('click', toggleSettings);
+  document.getElementById('settings-close').addEventListener('click', toggleSettings);
+  document.getElementById('cfg-copy').addEventListener('click', copyIngest);
+  document.getElementById('cfg-save').addEventListener('click', saveSettings);
 
   refresh();
   setInterval(refresh, INTERVAL * 1000);

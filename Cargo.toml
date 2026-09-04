@@ -6,7 +6,7 @@ description = "Receptor remoto de avisos de monitor-agent con panel web y almace
 
 [dependencies]
 axum = "0.8"
-tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "time", "sync"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "time", "sync", "signal"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
