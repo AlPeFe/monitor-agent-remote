@@ -1,6 +1,6 @@
 [package]
 name = "monitor-agent-remote"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Receptor remoto de avisos de monitor-agent con panel web y almacenamiento SQLite"
 
