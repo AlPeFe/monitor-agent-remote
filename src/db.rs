@@ -19,8 +19,13 @@ pub struct IngestPayload {
     pub status: String,
     #[serde(default)]
     pub message: String,
+    #[serde(default)]
     pub value: Option<f64>,
     pub timestamp: Option<i64>,
+    /// recover con gone=true: el check desapareció de la config del agente;
+    /// la central debe borrarlo de agent_checks (no dejarlo en ok fantasma).
+    #[serde(default)]
+    pub gone: Option<bool>,
     pub ok_count: Option<i64>,
     pub warn_count: Option<i64>,
     pub critical_count: Option<i64>,
@@ -238,18 +243,29 @@ impl Database {
                         params![p.agent_id],
                     )?;
                 }
-                // El check recuperado queda en ok (estado actual por check).
-                self.conn.execute(
-                    "INSERT INTO agent_checks (agent_id, check_type, target, status, message, value, last_event, ts)
-                     VALUES (?1, ?2, ?3, 'ok', ?4, ?5, 'recover', ?6)
-                     ON CONFLICT(agent_id, check_type, target) DO UPDATE SET
-                       status = 'ok',
-                       message = excluded.message,
-                       value = excluded.value,
-                       last_event = 'recover',
-                       ts = excluded.ts",
-                    params![p.agent_id, p.check_type, p.target, p.message, p.value, ts],
-                )?;
+                // recover con gone=true: el check desapareció de la config del
+                // agente -> se borra de agent_checks (sin ok fantasma).
+                let gone = p.gone.unwrap_or(false);
+                if gone {
+                    self.conn.execute(
+                        "DELETE FROM agent_checks
+                         WHERE agent_id = ?1 AND check_type = ?2 AND target = ?3",
+                        params![p.agent_id, p.check_type, p.target],
+                    )?;
+                } else {
+                    // El check recuperado queda en ok (estado actual por check).
+                    self.conn.execute(
+                        "INSERT INTO agent_checks (agent_id, check_type, target, status, message, value, last_event, ts)
+                         VALUES (?1, ?2, ?3, 'ok', ?4, ?5, 'recover', ?6)
+                         ON CONFLICT(agent_id, check_type, target) DO UPDATE SET
+                           status = 'ok',
+                           message = excluded.message,
+                           value = excluded.value,
+                           last_event = 'recover',
+                           ts = excluded.ts",
+                        params![p.agent_id, p.check_type, p.target, p.message, p.value, ts],
+                    )?;
+                }
             }
             _ => {} // otros eventos (p.ej. "ok") solo se almacenan
         }
@@ -437,10 +453,39 @@ mod tests {
             message: "test message".to_string(),
             value: None,
             timestamp: Some(1_700_000_000),
+            gone: None,
             ok_count: None,
             warn_count: None,
             critical_count: None,
         }
+    }
+
+    #[test]
+    fn recover_gone_removes_agent_check() {
+        let mut db = Database::open(":memory:").expect("open memory db");
+
+        // fail -> agent_checks guarda el check
+        db.ingest(&payload("srv-a", "fail", "process", "app.exe", "critical"))
+            .expect("fail");
+        assert_eq!(db.list_agent_checks("srv-a").expect("checks").len(), 1);
+
+        // recover normal -> el check queda ok
+        db.ingest(&payload("srv-a", "recover", "process", "app.exe", "ok"))
+            .expect("recover ok");
+        let checks = db.list_agent_checks("srv-a").expect("checks");
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].status, "ok");
+
+        // fail otra vez + recover gone=true -> el check se borra (no fantasma)
+        db.ingest(&payload("srv-a", "fail", "process", "app.exe", "critical"))
+            .expect("fail 2");
+        let mut gone = payload("srv-a", "recover", "process", "app.exe", "ok");
+        gone.gone = Some(true);
+        db.ingest(&gone).expect("recover gone");
+        assert!(
+            db.list_agent_checks("srv-a").expect("checks").is_empty(),
+            "check desaparecido debe borrarse de agent_checks"
+        );
     }
 
     #[test]
