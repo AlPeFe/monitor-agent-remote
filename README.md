@@ -24,6 +24,9 @@ recuperaciones) a este servicio mediante un simple POST. **monitor-agent-remote*
 los guarda en SQLite y muestra el estado de todos los servidores en un panel web
 con el mismo estilo rosa pastel que el agente.
 
+> Guía completa de instalación y uso (agente + central) en el repo del agente:
+> [`docs/GUIA-USO-INSTALACION.md`](https://github.com/AlPeFe/monitor-agent/blob/master/docs/GUIA-USO-INSTALACION.md)
+
 ## Uso rapido
 
 Requisitos: **Rust 1.96+**.
