@@ -61,6 +61,7 @@ Campos gestionables desde la web:
 | `token`       | Opcional. Si se define, `/api/ingest` exige `Authorization: Bearer <token>`.|
 | `db_path`     | Solo lectura (elegida antes del primer arranque).                           |
 | `ingest_url`  | URL que deben apuntar los `[exporter]` de los agentes.                      |
+| `retention`   | Retención de datos: días de eventos, horas de incidencias activas y minutos de offline. Se aplica cada hora (0 = indefinido). |
 
 ## Contrato del webhook
 
