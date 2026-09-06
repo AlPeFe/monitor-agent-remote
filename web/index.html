@@ -235,6 +235,15 @@ footer { margin-top: 18px; color: var(--muted); font-size: 11.5px; text-align: c
 .settings-body .mono { font-size: 13px; color: var(--text); word-break: break-all; font-family: var(--mono); }
 .settings-body .actions { display: flex; align-items: center; gap: 12px; margin-top: 6px; flex-wrap: wrap; }
 .settings-body .copied { font-size: 11px; color: var(--ok-text); font-weight: 700; }
+.settings-body .retention-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-top: 4px; }
+.settings-body .retention-row .field { margin-bottom: 8px; }
+.settings-body input[type="number"] {
+  width: 100%; box-sizing: border-box; padding: 8px 10px; border-radius: 10px;
+  border: 1px solid var(--border); background: var(--card); color: var(--text);
+  font-size: 13px; font-family: var(--mono);
+}
+.settings-body input[type="number"]:focus { outline: none; border-color: var(--accent-strong); }
+.settings-body .section-title { margin: 18px 0 4px; }
 
 /* ---------- foco accesible ---------- */
 :focus-visible { outline: 2px solid var(--accent-deep); outline-offset: 2px; border-radius: 4px; }
@@ -320,6 +329,27 @@ b.ev.crit { color: var(--crit-text); }
         <label>database</label>
         <span class="mono" id="cfg-dbpath"></span>
       </div>
+
+      <h3 class="section-title">Retención de datos</h3>
+      <p class="hint">La central purga automáticamente los datos viejos según esta política (se aplica cada hora). Pon 0 para conservar indefinidamente.</p>
+      <div class="retention-row">
+        <div class="field">
+          <label>Eventos (días)</label>
+          <input id="cfg-ret-events" type="number" min="0" placeholder="30">
+          <p class="hint">Falls y recovers conservados en el historial.</p>
+        </div>
+        <div class="field">
+          <label>Incidencias activas (horas)</label>
+          <input id="cfg-ret-alerts" type="number" min="0" placeholder="168">
+          <p class="hint">Un fallo sin recuperar se cierra tras este tiempo.</p>
+        </div>
+        <div class="field">
+          <label>Offline (minutos)</label>
+          <input id="cfg-ret-offline" type="number" min="0" placeholder="5">
+          <p class="hint">Sin heartbeat en este tiempo, el servidor se marca offline.</p>
+        </div>
+      </div>
+
       <div class="actions">
         <button class="btn primary" id="cfg-save">save</button>
         <span class="hint">token applies immediately</span>
@@ -584,18 +614,27 @@ b.ev.crit { color: var(--crit-text); }
       document.getElementById('cfg-token').value = s.token || '';
       document.getElementById('cfg-ingest').value = s.ingest_url;
       document.getElementById('cfg-dbpath').textContent = s.db_path;
+      var r = s.retention || {};
+      document.getElementById('cfg-ret-events').value = r.events_days != null ? r.events_days : 30;
+      document.getElementById('cfg-ret-alerts').value = r.alerts_hours != null ? r.alerts_hours : 168;
+      document.getElementById('cfg-ret-offline').value = r.offline_minutes != null ? r.offline_minutes : 5;
     } catch (e) { setBanner('settings fetch failed: ' + e); }
   }
   async function saveSettings() {
     var listen = document.getElementById('cfg-listen').value.trim();
     var token = document.getElementById('cfg-token').value;
+    var retention = {
+      events_days: parseInt(document.getElementById('cfg-ret-events').value, 10) || 0,
+      alerts_hours: parseInt(document.getElementById('cfg-ret-alerts').value, 10) || 0,
+      offline_minutes: parseInt(document.getElementById('cfg-ret-offline').value, 10) || 0,
+    };
     var btn = document.getElementById('cfg-save');
     btn.disabled = true; btn.textContent = 'saving…';
     try {
       var res = await fetch('/api/settings', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ listen: listen, token: token }),
+        body: JSON.stringify({ listen: listen, token: token, retention: retention }),
       });
       var data = await res.json();
       if (!res.ok || !data.ok) {

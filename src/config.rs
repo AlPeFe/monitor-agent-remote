@@ -46,4 +46,8 @@ pub fn load_bootstrap(path: &str) -> Bootstrap {
 pub struct Settings {
     pub listen: SocketAddr,
     pub token: Option<String>,
+    /// Política de retención de datos (días de eventos, horas de incidencias,
+    /// minutos de offline). Se persiste en `settings` y la aplica el worker.
+    #[serde(default)]
+    pub retention: crate::db::Retention,
 }

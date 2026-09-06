@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex, RwLock, watch};
 
 use crate::config::Settings;
-use crate::db::{AgentCheck, AgentRow, Database, EventRow, IngestPayload};
+use crate::db::{AgentCheck, AgentRow, Database, EventRow, IngestPayload, Retention};
 
 const INDEX_HTML: &str = include_str!("../web/index.html");
 
@@ -34,6 +34,9 @@ pub struct SettingsUpdate {
     /// Cadena vacía = desactivar la autenticación.
     #[serde(default)]
     pub token: String,
+    /// Retención opcional: si se envía, se persiste y aplica.
+    #[serde(default)]
+    pub retention: Option<Retention>,
 }
 
 #[derive(Debug, Serialize)]
@@ -168,6 +171,7 @@ async fn get_settings_handler(State(state): State<ApiState>) -> Json<Value> {
         "token": s.token.clone().unwrap_or_default(),
         "db_path": state.db_path,
         "ingest_url": format!("http://{}/api/ingest", s.listen),
+        "retention": s.retention,
     }))
 }
 
@@ -200,11 +204,22 @@ async fn update_settings_handler(
                 Json(json!({ "ok": false, "error": e.to_string() })),
             )
         })?;
+        if let Some(retention) = update.retention {
+            db.set_retention(&retention).map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "ok": false, "error": e.to_string() })),
+                )
+            })?;
+        }
     }
     {
         let mut s = state.settings.write().await;
         s.listen = addr;
         s.token = token.clone();
+        if let Some(retention) = update.retention {
+            s.retention = retention;
+        }
     }
 
     // Solo avisa al supervisor si el puerto/address cambió de verdad.
@@ -217,10 +232,12 @@ async fn update_settings_handler(
         }
     });
 
+    let s = state.settings.read().await;
     Ok(Json(json!({
         "ok": true,
         "listen": addr.to_string(),
         "token": token.unwrap_or_default(),
+        "retention": s.retention,
         "rebound": rebound,
     })))
 }

@@ -74,6 +74,34 @@ pub struct AgentCheck {
     pub ts: i64,
 }
 
+/// Política de retención de datos de la central. Se persiste en `settings`
+/// y se aplica de forma periódica por el worker de purga.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct Retention {
+    /// Días que se conservan los eventos (fails/recovers) en `events`.
+    /// 0 = conservar indefinidamente.
+    #[serde(default)]
+    pub events_days: i64,
+    /// Horas que se conserva la última incidencia activa sin recover en
+    /// `events`. 0 = conservar indefinidamente.
+    #[serde(default)]
+    pub alerts_hours: i64,
+    /// Minutos de inactividad para considerar a un agente "offline" en el
+    /// panel (por ejemplo 5 minutos con el heartbeat a 60 s). 0 = nunca.
+    #[serde(default)]
+    pub offline_minutes: i64,
+}
+
+impl Default for Retention {
+    fn default() -> Self {
+        Self {
+            events_days: 30,
+            alerts_hours: 24 * 7, // 7 días de incidencias sin recuperar
+            offline_minutes: 5,
+        }
+    }
+}
+
 impl Database {
     pub fn open(path: &str) -> rusqlite::Result<Self> {
         let conn = Connection::open(path)?;
@@ -125,7 +153,10 @@ impl Database {
                key    TEXT PRIMARY KEY,
                listen TEXT NOT NULL,
                token  TEXT
-             );",
+             );
+             ALTER TABLE settings ADD COLUMN retention_events_days INTEGER NOT NULL DEFAULT 30;
+             ALTER TABLE settings ADD COLUMN retention_alerts_hours INTEGER NOT NULL DEFAULT 168;
+             ALTER TABLE settings ADD COLUMN retention_offline_minutes INTEGER NOT NULL DEFAULT 5;",
         )?;
         Ok(Self { conn })
     }
@@ -151,6 +182,103 @@ impl Database {
             params![listen, token],
         )?;
         Ok(())
+    }
+
+    /// Lee la política de retención persistida (si la fila aún no existe o
+    /// las columnas no se han migrado, devuelve los valores por defecto).
+    pub fn get_retention(&self) -> Retention {
+        self.conn
+            .query_row(
+                "SELECT retention_events_days, retention_alerts_hours, retention_offline_minutes
+                 FROM settings WHERE key = 'default'",
+                [],
+                |r| {
+                    Ok(Retention {
+                        events_days: r.get(0)?,
+                        alerts_hours: r.get(1)?,
+                        offline_minutes: r.get(2)?,
+                    })
+                },
+            )
+            .unwrap_or_else(|_| Retention::default())
+    }
+
+    /// Guarda la política de retención (UPSERT sobre la fila 'default').
+    pub fn set_retention(&mut self, retention: &Retention) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO settings (key, listen, token, retention_events_days, retention_alerts_hours, retention_offline_minutes)
+             VALUES ('default', '', NULL, ?1, ?2, ?3)
+             ON CONFLICT(key) DO UPDATE SET
+               retention_events_days       = excluded.retention_events_days,
+               retention_alerts_hours      = excluded.retention_alerts_hours,
+               retention_offline_minutes   = excluded.retention_offline_minutes",
+            params![
+                retention.events_days,
+                retention.alerts_hours,
+                retention.offline_minutes
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Borra los datos viejos según la política de retención.
+    /// Devuelve el número de filas borradas en total.
+    pub fn purge_expired(&mut self, retention: &Retention) -> rusqlite::Result<i64> {
+        let now = now_unix();
+        let mut deleted = 0usize;
+
+        // 1) Eventos (fails/recovers) más antiguos que events_days.
+        if retention.events_days > 0 {
+            let cutoff = now - retention.events_days * 86_400;
+            deleted += self.conn.execute(
+                "DELETE FROM events WHERE ts < ?1 AND event <> 'heartbeat'",
+                params![cutoff],
+            )?;
+        }
+
+        // 2) Incidencias activas (último fail sin recover) abiertas más de
+        //    alerts_hours. Solo borra el fail si no hay ningún recover posterior
+        //    (si lo hay, ya lo habrá borrado la regla 1 por antigüedad).
+        if retention.alerts_hours > 0 {
+            let cutoff = now - retention.alerts_hours * 3600;
+            deleted += self.conn.execute(
+                "DELETE FROM events
+                 WHERE id IN (
+                   SELECT e.id FROM events e
+                   WHERE e.event = 'fail'
+                     AND e.ts < ?1
+                     AND NOT EXISTS (
+                       SELECT 1 FROM events r
+                       WHERE r.agent_id = e.agent_id
+                         AND r.check_type = e.check_type
+                         AND r.target = e.target
+                         AND r.event = 'recover'
+                         AND r.id > e.id
+                     )
+                 )",
+                params![cutoff],
+            )?;
+        }
+
+        // 3) agent_checks: estado por check. Se mantienen los checks vivos
+        //    (status fail = incidencia abierta) aunque sean antiguos, pero se
+        //    podan los checks en ok que llevan demasiado tiempo sin actividad.
+        //    La vida real de un check en ok la marca el heartbeat del agente,
+        //    así que usamos un umbral generoso: alerts_hours (o 7 días por
+        //    defecto si no hay incidencias configuradas).
+        let check_cutoff_hours = if retention.alerts_hours > 0 {
+            retention.alerts_hours
+        } else {
+            24 * 7
+        };
+        let check_cutoff = now - check_cutoff_hours * 3600;
+        deleted += self.conn.execute(
+            "DELETE FROM agent_checks
+             WHERE status = 'ok' AND ts < ?1",
+            params![check_cutoff],
+        )?;
+
+        Ok(deleted as i64)
     }
 
     /// Inserta el evento y actualiza el estado agregado del agente.
@@ -458,6 +586,42 @@ mod tests {
             warn_count: None,
             critical_count: None,
         }
+    }
+
+    #[test]
+    fn purge_expired_respects_retention() {
+        let mut db = Database::open(":memory:").expect("open memory db");
+        let retention = Retention {
+            events_days: 30,
+            alerts_hours: 24,
+            offline_minutes: 5,
+        };
+        let now = now_unix();
+
+        // Evento viejo (hace 40 días): debe purgarse.
+        db.conn
+            .execute(
+                "INSERT INTO events (agent_id, event, check_type, target, status, message, value, ts, received_at)
+                 VALUES ('srv-a', 'fail', 'process', 'old.exe', 'critical', 'x', NULL, ?1, ?1)",
+                params![now - 40 * 86_400],
+            )
+            .expect("insert old event");
+        // Evento reciente (hace 1 día): se conserva.
+        db.conn
+            .execute(
+                "INSERT INTO events (agent_id, event, check_type, target, status, message, value, ts, received_at)
+                 VALUES ('srv-a', 'fail', 'process', 'recent.exe', 'critical', 'x', NULL, ?1, ?1)",
+                params![now - 86_400],
+            )
+            .expect("insert recent event");
+
+        let purged = db.purge_expired(&retention).expect("purge");
+        assert!(purged >= 1, "debe borrar al menos el evento viejo");
+        let remaining: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(remaining, 1, "solo debe quedar el evento reciente");
     }
 
     #[test]

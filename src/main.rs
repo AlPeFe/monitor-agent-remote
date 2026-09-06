@@ -20,12 +20,13 @@ async fn main() {
 
     // Lee la configuración persistida; si es la primera vez, la siembra
     // desde el bootstrap (o desde los valores por defecto).
-    let (listen, token) = {
+    let (listen, token, retention) = {
         let mut db = db.lock().await;
         match db.get_settings().expect("read settings") {
             Some((listen, token)) => {
                 let addr: SocketAddr = listen.parse().expect("stored listen is invalid");
-                (addr, token)
+                let retention = db.get_retention();
+                (addr, token, retention)
             }
             None => {
                 let addr = bootstrap
@@ -34,24 +35,54 @@ async fn main() {
                 let token = bootstrap.token.clone();
                 db.set_settings(&addr.to_string(), token.as_deref())
                     .expect("seed settings");
-                (addr, token)
+                let retention = db.get_retention();
+                (addr, token, retention)
             }
         }
     };
     eprintln!("monitor-agent-remote: sqlite at {}", bootstrap.db_path);
 
-    let settings = Arc::new(RwLock::new(Settings { listen, token }));
+    let settings = Arc::new(RwLock::new(Settings {
+        listen,
+        token,
+        retention,
+    }));
 
     let (listen_tx, listen_rx) = watch::channel(listen);
     let (stop_tx, stop_rx) = watch::channel(false);
 
-    let app = api::router(db, settings, bootstrap.db_path, listen_tx);
+    let app = api::router(db.clone(), settings.clone(), bootstrap.db_path, listen_tx);
 
     tokio::spawn(serve_loop(app, listen_rx, stop_rx));
+    tokio::spawn(retention_worker(db, settings));
 
     tokio::signal::ctrl_c().await.expect("ctrl_c handler");
     eprintln!("monitor-agent-remote: shutting down");
     let _ = stop_tx.send(true);
+}
+
+/// Worker de retención: cada hora purga los datos viejos según la política
+/// configurada (días de eventos, horas de incidencias activas y checks en ok
+/// inactivos). Coge la política actual de `settings` (se puede cambiar en vivo
+/// desde la UI) y, si algo queda fuera de rango tras un cambio, lo aplica en
+/// el siguiente ciclo.
+async fn retention_worker(db: Arc<Mutex<Database>>, settings: Arc<RwLock<Settings>>) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+    // Primera purga al arrancar (sin esperar la primera hora).
+    interval.tick().await;
+    loop {
+        interval.tick().await;
+        let retention = settings.read().await.retention;
+        let mut db = db.lock().await;
+        match db.purge_expired(&retention) {
+            Ok(n) => {
+                if n > 0 {
+                    eprintln!("monitor-agent-remote: retención: purgadas {n} filas");
+                }
+            }
+            Err(e) => eprintln!("monitor-agent-remote: retención falló: {e}"),
+        }
+    }
 }
 
 /// Sirve la app rebindeando cuando cambia `listen` desde la UI (sin reiniciar).
