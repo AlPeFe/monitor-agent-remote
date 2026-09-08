@@ -152,12 +152,31 @@ impl Database {
              CREATE TABLE IF NOT EXISTS settings (
                key    TEXT PRIMARY KEY,
                listen TEXT NOT NULL,
-               token  TEXT
-             );
-             ALTER TABLE settings ADD COLUMN retention_events_days INTEGER NOT NULL DEFAULT 30;
-             ALTER TABLE settings ADD COLUMN retention_alerts_hours INTEGER NOT NULL DEFAULT 168;
-             ALTER TABLE settings ADD COLUMN retention_offline_minutes INTEGER NOT NULL DEFAULT 5;",
+               token  TEXT,
+               retention_events_days    INTEGER NOT NULL DEFAULT 30,
+               retention_alerts_hours   INTEGER NOT NULL DEFAULT 168,
+               retention_offline_minutes INTEGER NOT NULL DEFAULT 5
+             );",
         )?;
+
+        // Migración idempotente: las BDs creadas por versiones anteriores
+        // (0.1.x / primeras 0.2.x) no tienen las columnas de retención. Se
+        // añaden SOLO si faltan; antes este bloque corría incondicionalmente
+        // en cada arranque y la segunda ejecución panikeaba con
+        // "duplicate column name: retention_events_days" (borrar la DB
+        // "arreglaba" el arranque porque la tabla se recreaba desde cero).
+        let retention_cols: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('settings') WHERE name LIKE 'retention_%'",
+            [],
+            |r| r.get(0),
+        )?;
+        if retention_cols < 3 {
+            conn.execute_batch(
+                "ALTER TABLE settings ADD COLUMN retention_events_days INTEGER NOT NULL DEFAULT 30;
+                 ALTER TABLE settings ADD COLUMN retention_alerts_hours INTEGER NOT NULL DEFAULT 168;
+                 ALTER TABLE settings ADD COLUMN retention_offline_minutes INTEGER NOT NULL DEFAULT 5;",
+            )?;
+        }
         Ok(Self { conn })
     }
 
@@ -695,6 +714,71 @@ mod tests {
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].last_seen, now_unix());
         assert!(agents[0].first_seen > 0);
+    }
+
+    /// Regresión: abrir la misma BD de fichero varias veces (reinicios del
+    /// proceso) debe funcionar. Antes, la migración ALTER corría sin guarda y
+    /// el segundo arranque panikeaba con "duplicate column name".
+    #[test]
+    fn open_is_idempotent_across_restarts() {
+        let path = std::env::temp_dir().join(format!(
+            "mar_restart_test_{}_{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        let path_str = path.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&path);
+
+        for _ in 0..3 {
+            let db = Database::open(&path_str).expect("open must not fail on restart");
+            let _ = db;
+        }
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path_str}-wal"));
+        let _ = std::fs::remove_file(format!("{path_str}-shm"));
+    }
+
+    /// Regresión: una BD creada por una versión anterior (settings sin las
+    /// columnas de retención) debe migrarse al abrirla.
+    #[test]
+    fn open_migrates_legacy_settings_table() {
+        let path = std::env::temp_dir().join(format!(
+            "mar_legacy_test_{}_{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        let path_str = path.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&path);
+
+        // Esquema legacy: settings con SOLO key/listen/token.
+        {
+            let conn = rusqlite::Connection::open(&path).expect("open legacy db");
+            conn.execute_batch(
+                "CREATE TABLE settings (
+                   key    TEXT PRIMARY KEY,
+                   listen TEXT NOT NULL,
+                   token  TEXT
+                 );
+                 INSERT INTO settings (key, listen, token) VALUES ('default', '127.0.0.1:9600', NULL);",
+            )
+            .expect("create legacy schema");
+        }
+
+        let db = Database::open(&path_str).expect("legacy db must migrate");
+        let (listen, _) = db.get_settings().expect("read").expect("seeded row");
+        assert_eq!(listen, "127.0.0.1:9600");
+        // La retención migrada usa los valores por defecto de la nueva versión.
+        assert_eq!(db.get_retention().events_days, 30);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path_str}-wal"));
+        let _ = std::fs::remove_file(format!("{path_str}-shm"));
     }
 
     #[test]
