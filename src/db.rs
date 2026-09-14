@@ -258,8 +258,27 @@ impl Database {
         // 2) Incidencias activas (último fail sin recover) abiertas más de
         //    alerts_hours. Solo borra el fail si no hay ningún recover posterior
         //    (si lo hay, ya lo habrá borrado la regla 1 por antigüedad).
+        let mut purged_agents: Vec<String> = Vec::new();
         if retention.alerts_hours > 0 {
             let cutoff = now - retention.alerts_hours * 3600;
+            // Averigua qué agentes pierden incidencias antes de borrar.
+            let mut stmt = self.conn.prepare(
+                "SELECT DISTINCT agent_id FROM events
+                 WHERE event = 'fail'
+                   AND ts < ?1
+                   AND NOT EXISTS (
+                     SELECT 1 FROM events r
+                     WHERE r.agent_id = events.agent_id
+                       AND r.check_type = events.check_type
+                       AND r.target = events.target
+                       AND r.event = 'recover'
+                       AND r.id > events.id
+                   )",
+            )?;
+            let rows = stmt.query_map(params![cutoff], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                purged_agents.push(row?);
+            }
             deleted += self.conn.execute(
                 "DELETE FROM events
                  WHERE id IN (
@@ -276,6 +295,34 @@ impl Database {
                      )
                  )",
                 params![cutoff],
+            )?;
+        }
+        // Reconciliación: los agentes que perdieron TODAS sus incidencias
+        // activas (o que nunca tuvieron recover) deben volver a ok, y sus
+        // checks no deben quedar en fail fantasma (el fail ya se purgó).
+        for agent in &purged_agents {
+            // ¿Queda alguna incidencia activa para este agente?
+            let active = self.active_alerts_for_agent(agent)?;
+            if active == 0 {
+                self.conn.execute(
+                    "UPDATE agents SET status = 'ok' WHERE agent_id = ?1",
+                    params![agent],
+                )?;
+            }
+            // Limpia los agent_checks en fail que ya no tienen un fail activo
+            // (el evento se purgó o el check se recuperó en el ínterin).
+            self.conn.execute(
+                "DELETE FROM agent_checks
+                 WHERE agent_id = ?1
+                   AND last_event = 'fail'
+                   AND NOT EXISTS (
+                     SELECT 1 FROM events
+                     WHERE events.agent_id = agent_checks.agent_id
+                       AND events.check_type = agent_checks.check_type
+                       AND events.target = agent_checks.target
+                       AND events.event = 'fail'
+                   )",
+                params![agent],
             )?;
         }
 
@@ -345,11 +392,36 @@ impl Database {
 
         match p.event.as_str() {
             "heartbeat" => {
+                // El heartbeat refleja el resumen agregado que el agente cree
+                // tener. Pero no debe ENMASCARAR una incidencia activa: si la
+                // central aún tiene fails sin recover para este agente, su
+                // estado global sigue siendo crítico/peor, y el heartbeat no
+                // puede bajarlo a ok (el recover llegará por su propio canal).
+                let active = self.active_alerts_for_agent(&p.agent_id)?;
+                let hb_status = if active > 0 {
+                    // conserva el estado previo del agente (crítico si algo
+                    // sigue abierto); solo sube si el heartbeat es más grave.
+                    let prev: String = self
+                        .conn
+                        .query_row(
+                            "SELECT status FROM agents WHERE agent_id = ?1",
+                            params![p.agent_id],
+                            |r| r.get(0),
+                        )
+                        .unwrap_or_else(|_| "unknown".to_string());
+                    if severity(status) > severity(&prev) {
+                        status.to_string()
+                    } else {
+                        prev
+                    }
+                } else {
+                    status.to_string()
+                };
                 self.conn.execute(
                     "UPDATE agents SET status = ?1, ok_count = ?2, warn_count = ?3, critical_count = ?4
                      WHERE agent_id = ?5",
                     params![
-                        status,
+                        hb_status,
                         p.ok_count.unwrap_or(0),
                         p.warn_count.unwrap_or(0),
                         p.critical_count.unwrap_or(0),
@@ -585,6 +657,17 @@ fn now_unix() -> i64 {
         .unwrap_or_default()
 }
 
+/// Orden de severidad para combinar estados: ok < warn < critical.
+/// Cualquier valor desconocido se trata como warn (ni mejor ni peor).
+fn severity(status: &str) -> u8 {
+    match status {
+        "critical" => 3,
+        "warn" => 2,
+        "ok" => 1,
+        _ => 2,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -815,4 +898,71 @@ mod tests {
         let agents = db.list_agents().expect("agents");
         assert_eq!(agents[0].active_alerts, 1);
     }
+
+    /// La purga de una incidencia activa caducada (fail sin recover más viejo
+    /// que alerts_hours) debe dejar el estado consistente: el agente vuelve a
+    /// ok y el check no queda en fail fantasma. Antes, `purge_expired` borraba
+    /// el evento fail pero dejaba `agents.status='critical'` y el
+    /// `agent_checks` en `fail` para siempre, mostrando en el panel un
+    /// servidor crítico con 0 incidencias.
+    #[test]
+    fn purge_of_active_alert_reconciles_agent_state() {
+        let mut db = Database::open(":memory:").expect("open memory db");
+        let now = now_unix();
+
+        // incidencia activa (fail sin recover) de hace 10 días
+        db.ingest(&payload("srv-a", "fail", "process", "app.exe", "critical"))
+            .expect("fail");
+        db.conn
+            .execute(
+                "UPDATE events SET ts = ?1 WHERE event = 'fail'",
+                params![now - 10 * 86_400],
+            )
+            .expect("age the fail");
+
+        // agente queda en critical con 1 incidencia antes de purgar
+        let agents = db.list_agents().expect("agents");
+        assert_eq!(agents[0].status, "critical");
+        assert_eq!(agents[0].active_alerts, 1);
+
+        let retention = Retention {
+            events_days: 0,
+            alerts_hours: 24, // 24h: la incidencia de 10 días caduca
+            offline_minutes: 5,
+        };
+        let purged = db.purge_expired(&retention).expect("purge");
+        assert!(purged >= 1, "debe purgar el fail caducado");
+
+        let agents = db.list_agents().expect("agents");
+        assert_eq!(agents[0].active_alerts, 0, "sin incidencias activas tras la purga");
+        assert_eq!(
+            agents[0].status, "ok",
+            "agente sin incidencias activas debe volver a ok (no quedar critical fantasma)"
+        );
+        let checks = db.list_agent_checks("srv-a").expect("checks");
+        assert!(
+            checks.is_empty() || checks.iter().all(|c| c.status == "ok"),
+            "no deben quedar checks en fail fantasma tras purgar la incidencia, got {:?}",
+            checks
+        );
+    }
+
+
+
+    #[test]
+    fn heartbeat_does_not_hide_active_alert() {
+        let mut db = Database::open(":memory:").expect("open memory db");
+        // incidencia activa
+        db.ingest(&payload("srv-a", "fail", "process", "app.exe", "critical")).expect("fail");
+        // heartbeat con todo ok (pero la incidencia no se ha recuperado)
+        let mut hb = payload("srv-a", "heartbeat", "summary", "server", "ok");
+        hb.ok_count = Some(5);
+        hb.critical_count = Some(0);
+        db.ingest(&hb).expect("heartbeat");
+        let agents = db.list_agents().expect("agents");
+        // La incidencia sigue activa: el agente debe seguir critical, no ok
+        assert_eq!(agents[0].active_alerts, 1);
+        assert_eq!(agents[0].status, "critical", "heartbeat no debe enmascarar una incidencia activa");
+    }
+
 }
