@@ -29,6 +29,24 @@ pub struct IngestPayload {
     pub ok_count: Option<i64>,
     pub warn_count: Option<i64>,
     pub critical_count: Option<i64>,
+    /// Inventario de checks que manda el heartbeat: permite pintar TODOS los
+    /// checks del servidor (también los que están OK) y borrar los retirados.
+    /// Los agentes anteriores no lo mandan (queda vacío y no se toca nada).
+    #[serde(default)]
+    pub checks: Vec<CheckSnapshot>,
+}
+
+/// Una comprobación dentro del inventario del heartbeat.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CheckSnapshot {
+    pub check_type: String,
+    pub target: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub message: String,
+    #[serde(default)]
+    pub value: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -428,6 +446,9 @@ impl Database {
                         p.agent_id
                     ],
                 )?;
+                // Inventario: estado actual de TODOS los checks del servidor,
+                // aunque nunca hayan fallado (y limpieza de los retirados).
+                self.apply_check_inventory(&p.agent_id, &p.checks, ts)?;
             }
             "fail" => {
                 // Sube el nivel de gravedad si hace falta, nunca lo baja.
@@ -513,6 +534,68 @@ impl Database {
             )
             .optional()
             .map(|v| v.unwrap_or(0))
+    }
+
+    /// Aplica el inventario de checks del heartbeat sobre `agent_checks`.
+    ///
+    /// - Refresca estado/mensaje/valor/fecha de cada check que manda el agente
+    ///   (también los que están OK: antes la central no sabía ni que existían).
+    /// - Borra los que ya no vienen: el agente los ha quitado de su config.
+    /// - No toca `last_event`, que es de la historia fail/recover.
+    /// - Inventario vacío (agente antiguo) = no se toca nada.
+    fn apply_check_inventory(
+        &mut self,
+        agent_id: &str,
+        checks: &[CheckSnapshot],
+        ts: i64,
+    ) -> rusqlite::Result<()> {
+        if checks.is_empty() {
+            return Ok(());
+        }
+        for c in checks {
+            self.conn.execute(
+                "INSERT INTO agent_checks (agent_id, check_type, target, status, message, value, last_event, ts)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'heartbeat', ?7)
+                 ON CONFLICT(agent_id, check_type, target) DO UPDATE SET
+                   status  = excluded.status,
+                   message = excluded.message,
+                   value   = excluded.value,
+                   ts      = excluded.ts",
+                params![
+                    agent_id,
+                    c.check_type,
+                    c.target,
+                    c.status,
+                    c.message,
+                    c.value,
+                    ts
+                ],
+            )?;
+        }
+
+        let mut stmt = self
+            .conn
+            .prepare("SELECT check_type, target FROM agent_checks WHERE agent_id = ?1")?;
+        let existentes = stmt
+            .query_map(params![agent_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+
+        let vigentes: std::collections::HashSet<(&str, &str)> = checks
+            .iter()
+            .map(|c| (c.check_type.as_str(), c.target.as_str()))
+            .collect();
+        for (check_type, target) in existentes {
+            if !vigentes.contains(&(check_type.as_str(), target.as_str())) {
+                self.conn.execute(
+                    "DELETE FROM agent_checks WHERE agent_id = ?1 AND check_type = ?2 AND target = ?3",
+                    params![agent_id, check_type, target],
+                )?;
+            }
+        }
+        Ok(())
     }
 
     pub fn list_agents(&self) -> rusqlite::Result<Vec<AgentRow>> {
@@ -687,6 +770,17 @@ mod tests {
             ok_count: None,
             warn_count: None,
             critical_count: None,
+            checks: vec![],
+        }
+    }
+
+    fn snapshot(check: &str, target: &str, status: &str) -> CheckSnapshot {
+        CheckSnapshot {
+            check_type: check.to_string(),
+            target: target.to_string(),
+            status: status.to_string(),
+            message: "snapshot".to_string(),
+            value: Some(1.5),
         }
     }
 
@@ -797,6 +891,54 @@ mod tests {
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].last_seen, now_unix());
         assert!(agents[0].first_seen > 0);
+    }
+
+    /// El heartbeat lleva el inventario completo: la central debe conocer los
+    /// checks sanos (que nunca han fallado) y borrar los que ya no existen.
+    #[test]
+    fn heartbeat_inventory_creates_and_prunes_checks() {
+        let mut db = Database::open(":memory:").expect("open memory db");
+        let mut p = payload("srv-a", "heartbeat", "summary", "server", "ok");
+        p.checks = vec![
+            snapshot("process", "app.exe", "ok"),
+            snapshot("http_endpoint", "http://x/health", "critical"),
+            snapshot("disk", "C", "warn"),
+        ];
+        db.ingest(&p).expect("heartbeat con inventario");
+
+        let checks = db.list_agent_checks("srv-a").expect("checks");
+        assert_eq!(checks.len(), 3, "todos los checks, también los sanos");
+        assert_eq!(
+            checks.iter().filter(|c| c.status == "ok").count(),
+            1,
+            "el check OK aparece en el panel"
+        );
+
+        // El agente retira dos checks de su configuración.
+        p.checks = vec![snapshot("process", "app.exe", "ok")];
+        db.ingest(&p).expect("heartbeat sin los retirados");
+        let checks = db.list_agent_checks("srv-a").expect("checks");
+        assert_eq!(checks.len(), 1, "los retirados se borran");
+        assert_eq!(checks[0].target, "app.exe");
+    }
+
+    /// Un agente antiguo (sin inventario en el heartbeat) no debe vaciar el
+    /// panel de checks.
+    #[test]
+    fn heartbeat_without_inventory_keeps_checks() {
+        let mut db = Database::open(":memory:").expect("open memory db");
+        db.ingest(&payload("srv-a", "fail", "process", "app.exe", "critical"))
+            .expect("fail");
+        let antes = db.list_agent_checks("srv-a").expect("checks").len();
+        assert_eq!(antes, 1);
+
+        db.ingest(&payload("srv-a", "heartbeat", "summary", "server", "ok"))
+            .expect("heartbeat sin inventario");
+        assert_eq!(
+            db.list_agent_checks("srv-a").expect("checks").len(),
+            1,
+            "sin inventario no se borra nada"
+        );
     }
 
     /// Regresión: abrir la misma BD de fichero varias veces (reinicios del

@@ -81,6 +81,7 @@ Cada **monitor-agent** hace `POST /api/ingest` con `Content-Type: application/js
 | `ok_count`       | number?         | Solo heartbeat: comprobaciones OK.                               |
 | `warn_count`     | number?         | Solo heartbeat: comprobaciones en Warning.                       |
 | `critical_count` | number?         | Solo heartbeat: comprobaciones en Critical.                      |
+| `checks`         | array?          | Solo heartbeat: inventario de TODAS las comprobaciones del servidor (aunque estén OK), con `check_type`, `target`, `status`, `message` y `value`. La central refresca con él su vista "estado actual" y borra los checks que el agente ya no vigila. |
 
 Ejemplo:
 
