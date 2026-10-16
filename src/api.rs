@@ -120,12 +120,57 @@ async fn ingest_handler(
 }
 
 /// GET /api/agents — estado agregado de todos los servidores.
+///
+/// Los agentes sin heartbeat dentro de `retention.offline_minutes` pasan a
+/// estado "offline": si el servidor vigilado se cae, el panel no puede seguir
+/// mostrando el último estado (ok) como si estuviera vivo.
 async fn agents_handler(State(state): State<ApiState>) -> Result<Json<Vec<AgentRow>>, StatusCode> {
-    let db = state.db.lock().await;
-    db.list_agents().map(Json).map_err(|e| {
-        eprintln!("monitor-agent-remote: list agents failed: {e}");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })
+    let offline_minutes = state.settings.read().await.retention.offline_minutes;
+    let mut agents = {
+        let db = state.db.lock().await;
+        db.list_agents().map_err(|e| {
+            eprintln!("monitor-agent-remote: list agents failed: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+    };
+    let offline_seconds = offline_minutes.max(0).saturating_mul(60);
+    if offline_seconds > 0 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or_default();
+        for agent in &mut agents {
+            if mark_offline(agent.last_seen, now, offline_seconds) {
+                agent.status = "offline".to_string();
+            }
+        }
+    }
+    Ok(Json(agents))
+}
+
+/// ¿Este agente lleva demasiado tiempo sin dar señales de vida?
+pub fn mark_offline(last_seen: i64, now: i64, offline_seconds: i64) -> bool {
+    last_seen > 0 && now.saturating_sub(last_seen) > offline_seconds
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mark_offline;
+
+    #[test]
+    fn agente_fresco_no_esta_offline() {
+        assert!(!mark_offline(1_000, 1_060, 300));
+    }
+
+    #[test]
+    fn agente_sin_heartbeat_esta_offline() {
+        assert!(mark_offline(1_000, 1_400, 300));
+    }
+
+    #[test]
+    fn agente_nunca_visto_no_se_marca() {
+        assert!(!mark_offline(0, 10_000, 300));
+    }
 }
 
 /// GET /api/agents/{agent_id}/checks?limit=50 — historial de un servidor.

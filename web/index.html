@@ -31,6 +31,9 @@
   --crit-text: #bd2f33;
   --crit-tint: #fdeaea;
   --unknown: #a48b99;
+  --offline: #6b7280;        /* gris: sin heartbeat, servidor caido */
+  --offline-tint: #eef0f3;
+  --offline-text: #3f4750;
   --shadow-1: 0 1px 2px rgba(201, 80, 122, 0.05), 0 2px 8px rgba(201, 80, 122, 0.06);
   --shadow-2: 0 2px 6px rgba(201, 80, 122, 0.06), 0 12px 28px rgba(201, 80, 122, 0.12);
   --ui: "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
@@ -118,6 +121,7 @@ header .dot.srv { background: var(--accent-strong); }
 .card.warn { border-left-color: var(--warn); }
 .card.critical { border-left-color: var(--crit); }
 .card.unknown { border-left-color: var(--unknown); }
+.card.offline { border-left-color: var(--offline); }
 .card .top { display: flex; align-items: center; gap: 10px; justify-content: space-between; }
 .card .name { font-weight: 800; font-size: 14px; word-break: break-all; }
 .card .host { color: var(--muted); font-size: 11.5px; margin-top: 1px; word-break: break-all; font-family: var(--mono); }
@@ -136,6 +140,7 @@ header .dot.srv { background: var(--accent-strong); }
 .badge.warn { background: var(--warn-tint); color: var(--warn-text); }
 .badge.critical { background: var(--crit-tint); color: var(--crit-text); }
 .badge.unknown { background: var(--accent-tint); color: var(--muted); }
+.badge.offline { background: var(--offline-tint); color: var(--offline-text); }
 
 /* ---------- grupos / tablas (alertas, eventos) ---------- */
 .group {
@@ -179,6 +184,7 @@ td.age { text-align: right; width: 84px; white-space: nowrap; color: var(--muted
 .glyph.warn { background: var(--warn); }
 .glyph.critical { background: var(--crit); }
 .glyph.unknown { background: var(--unknown); }
+.glyph.offline { background: var(--offline); }
 
 .empty { padding: 26px 18px; text-align: center; }
 .empty .empty-t { font-weight: 700; color: var(--text); margin-bottom: 4px; }
@@ -389,11 +395,11 @@ b.ev.crit { color: var(--crit-text); }
     return Math.floor(delta / 86400) + 'd ago';
   }
   function statusBadge(status) {
-    const cls = ['ok', 'warn', 'critical', 'unknown'].includes(status) ? status : 'unknown';
+    const cls = ['ok', 'warn', 'critical', 'unknown', 'offline'].includes(status) ? status : 'unknown';
     return '<span class="badge ' + cls + '">' + cls + '</span>';
   }
   function glyph(status) {
-    const cls = ['ok', 'warn', 'critical', 'unknown'].includes(status) ? status : 'unknown';
+    const cls = ['ok', 'warn', 'critical', 'unknown', 'offline'].includes(status) ? status : 'unknown';
     return '<span class="glyph ' + cls + '"></span>';
   }
 
@@ -402,7 +408,7 @@ b.ev.crit { color: var(--crit-text); }
     grid.innerHTML = '';
     agents.forEach(function (a) {
       const card = document.createElement('div');
-      card.className = 'card ' + (['ok', 'warn', 'critical', 'unknown'].includes(a.status) ? a.status : 'unknown');
+      card.className = 'card ' + (['ok', 'warn', 'critical', 'unknown', 'offline'].includes(a.status) ? a.status : 'unknown');
       card.innerHTML =
         '<div class="top">' + statusBadge(a.status) + '<span class="name">' + escapeHtml(a.agent_id) + '</span></div>' +
         '<div class="host">' + escapeHtml(a.agent_host || '') + '</div>' +

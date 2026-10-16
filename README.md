@@ -61,7 +61,7 @@ Campos gestionables desde la web:
 | `token`       | Opcional. Si se define, `/api/ingest` exige `Authorization: Bearer <token>`.|
 | `db_path`     | Solo lectura (elegida antes del primer arranque).                           |
 | `ingest_url`  | URL que deben apuntar los `[exporter]` de los agentes.                      |
-| `retention`   | Retención de datos: días de eventos, horas de incidencias activas y minutos de offline. Se aplica cada hora (0 = indefinido). |
+| `retention`   | Retención de datos: días de eventos, horas de incidencias activas y minutos para marcar un servidor offline. La purga se aplica cada hora; el estado offline, en vivo (0 = indefinido). |
 
 ## Contrato del webhook
 
@@ -105,7 +105,7 @@ Respuesta: `200 {"ok": true, "stored": 42, "agent_id": "server-web-01"}`.
 | Metodo | Ruta                          | Descripcion                              |
 |--------|-------------------------------|------------------------------------------|
 | POST   | `/api/ingest`                 | Recibe un evento de un agente.           |
-| GET    | `/api/agents`                 | Estado agregado de todos los servidores. |
+| GET    | `/api/agents`                 | Estado agregado de todos los servidores. Un agente sin heartbeat dentro de `retention.offline_minutes` aparece con `status: "offline"`. |
 | GET    | `/api/agents/{id}/events`     | Historial de eventos de un servidor.     |
 | GET    | `/api/alerts`                 | Avisos activos (fail sin recover).       |
 | GET    | `/api/settings`               | Config actual (listen, token, db_path, ingest_url). |
