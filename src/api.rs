@@ -1,9 +1,10 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::{Html, IntoResponse};
+use axum::middleware::{self, Next};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
@@ -52,6 +53,27 @@ pub fn router(
     db_path: String,
     listen_tx: watch::Sender<SocketAddr>,
 ) -> Router {
+    let state = ApiState {
+        db,
+        settings,
+        db_path,
+        listen_tx,
+    };
+
+    // Los ajustes (y el token que devuelven) NO pueden quedar abiertos: si hay
+    // token configurado, GET/PUT /api/settings exigen Bearer, igual que el
+    // ingest. El panel (estado, agentes, alertas) sigue siendo público en la
+    // LAN para que cualquiera pueda mirar sin poder cambiar nada.
+    let settings_router = Router::new()
+        .route(
+            "/api/settings",
+            get(get_settings_handler).put(update_settings_handler),
+        )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_settings_auth,
+        ));
+
     Router::new()
         .route("/", get(index_handler))
         .route("/api/ingest", post(ingest_handler))
@@ -59,13 +81,35 @@ pub fn router(
         .route("/api/agents/{agent_id}/events", get(agent_events_handler))
         .route("/api/agents/{agent_id}/checks", get(agent_checks_handler))
         .route("/api/alerts", get(alerts_handler))
-        .route("/api/settings", get(get_settings_handler).put(update_settings_handler))
-        .with_state(ApiState {
-            db,
-            settings,
-            db_path,
-            listen_tx,
-        })
+        .merge(settings_router)
+        .with_state(state)
+}
+
+/// Exige Authorization: Bearer <token> en /api/settings cuando hay token.
+async fn require_settings_auth(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    request: Request,
+    next: Next,
+) -> Response {
+    let expected = state.settings.read().await.token.clone();
+    if let Some(expected) = expected {
+        let provided = headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if provided != format!("Bearer {expected}") {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({
+                    "ok": false,
+                    "error": "unauthorized: falta el token de acceso (Authorization: Bearer <token>)"
+                })),
+            )
+                .into_response();
+        }
+    }
+    next.run(request).await
 }
 
 async fn index_handler() -> impl IntoResponse {

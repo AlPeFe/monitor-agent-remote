@@ -108,11 +108,14 @@ Respuesta: `200 {"ok": true, "stored": 42, "agent_id": "server-web-01"}`.
 | GET    | `/api/agents`                 | Estado agregado de todos los servidores. Un agente sin heartbeat dentro de `retention.offline_minutes` aparece con `status: "offline"`. |
 | GET    | `/api/agents/{id}/events`     | Historial de eventos de un servidor.     |
 | GET    | `/api/alerts`                 | Avisos activos (fail sin recover).       |
-| GET    | `/api/settings`               | Config actual (listen, token, db_path, ingest_url). |
+| GET    | `/api/settings`               | Config actual (listen, token, db_path, ingest_url). Con token definido exige `Authorization: Bearer`. |
 | PUT    | `/api/settings`               | Guarda `listen` y `token` (aplica en vivo). |
 
-Si defines `token` en la configuracion, `/api/ingest` exige la cabecera
-`Authorization: Bearer <token>`.
+Si defines `token` en la configuracion, `/api/ingest` **y** `/api/settings`
+(`GET`/`PUT`) exigen la cabecera `Authorization: Bearer <token>`. El resto del
+panel (estado, agentes, alertas) sigue siendo de solo lectura y sin
+autenticación para la LAN. El navegador guarda el token de acceso en su
+`localStorage` (campo *access token* del panel de ajustes).
 
 ## Log
 

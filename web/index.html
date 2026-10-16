@@ -329,7 +329,12 @@ b.ev.crit { color: var(--crit-text); }
       <div class="field">
         <label>auth token <span>(optional)</span></label>
         <input id="cfg-token" type="text" placeholder="empty = no auth">
-        <p class="hint">If set, <code>/api/ingest</code> requires <code>Authorization: Bearer &lt;token&gt;</code>.</p>
+        <p class="hint">If set, <code>/api/ingest</code> and <code>/api/settings</code> require <code>Authorization: Bearer &lt;token&gt;</code>.</p>
+      </div>
+      <div class="field">
+        <label>access token <span>(this browser only)</span></label>
+        <input id="cfg-access" type="password" placeholder="paste the token to manage settings">
+        <p class="hint">Kept in <code>localStorage</code> of this browser; needed only when the server has a token.</p>
       </div>
       <div class="field">
         <label>database</label>
@@ -605,6 +610,25 @@ b.ev.crit { color: var(--crit-text); }
 
   var settingsOpen = false;
   function setBanner(msg) { document.getElementById('banner').textContent = msg || ''; }
+
+  // Token de acceso para /api/settings: vive solo en este navegador.
+  var ACCESS_KEY = 'mar_access_token';
+  function getAccessToken() {
+    try { return localStorage.getItem(ACCESS_KEY) || ''; } catch (e) { return ''; }
+  }
+  function setAccessToken(t) {
+    try {
+      if (t) localStorage.setItem(ACCESS_KEY, t); else localStorage.removeItem(ACCESS_KEY);
+    } catch (e) {}
+    var f = document.getElementById('cfg-access');
+    if (f) f.value = t || '';
+  }
+  function authHeaders(extra) {
+    var h = extra || {};
+    var t = getAccessToken();
+    if (t) h['Authorization'] = 'Bearer ' + t;
+    return h;
+  }
   function toggleSettings() {
     settingsOpen = !settingsOpen;
     var el = document.getElementById('settings');
@@ -613,7 +637,11 @@ b.ev.crit { color: var(--crit-text); }
   }
   async function loadSettings() {
     try {
-      var res = await fetch('/api/settings', { cache: 'no-store' });
+      var res = await fetch('/api/settings', { cache: 'no-store', headers: authHeaders() });
+      if (res.status === 401) {
+        setBanner('settings: falta el token de acceso (rellena "access token" con el token de la central)');
+        return;
+      }
       if (!res.ok) { setBanner('settings ' + res.status); return; }
       var s = await res.json();
       document.getElementById('cfg-listen').value = s.listen;
@@ -639,13 +667,18 @@ b.ev.crit { color: var(--crit-text); }
     try {
       var res = await fetch('/api/settings', {
         method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({ listen: listen, token: token, retention: retention }),
       });
       var data = await res.json();
-      if (!res.ok || !data.ok) {
+      if (res.status === 401) {
+        setBanner('save failed: token de acceso incorrecto o ausente');
+      } else if (!res.ok || !data.ok) {
         setBanner('save failed: ' + (data.error || res.status));
       } else {
+        // El token que acabas de guardar es el que hay que usar a partir de
+        // ahora para leer/escribir ajustes: lo recordamos en este navegador.
+        setAccessToken(token || '');
         setBanner('settings saved');
         loadSettings();
       }
@@ -667,6 +700,7 @@ b.ev.crit { color: var(--crit-text); }
   document.getElementById('cfg-copy').addEventListener('click', copyIngest);
   document.getElementById('cfg-save').addEventListener('click', saveSettings);
 
+  setAccessToken(getAccessToken());
   refresh();
   setInterval(refresh, INTERVAL * 1000);
 </script>
