@@ -114,6 +114,12 @@ Respuesta: `200 {"ok": true, "stored": 42, "agent_id": "server-web-01"}`.
 Si defines `token` en la configuracion, `/api/ingest` exige la cabecera
 `Authorization: Bearer <token>`.
 
+## Log
+
+La central escribe su traza en `monitor-agent-remote.log` (junto a la
+configuración / `monitor.db`) además de stderr: imprescindible cuando corre
+como tarea programada o servicio, donde stderr no lo recoge nadie.
+
 ## Compilar
 
 ```powershell

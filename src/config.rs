@@ -30,7 +30,7 @@ fn default_db_path() -> String {
 pub fn load_bootstrap(path: &str) -> Bootstrap {
     match fs::read_to_string(path) {
         Ok(content) => toml::from_str(&content).unwrap_or_else(|e| {
-            eprintln!("monitor-agent-remote: invalid {path}: {e}");
+            crate::log_error!("invalid {path}: {e}");
             std::process::exit(1);
         }),
         Err(_) => Bootstrap {

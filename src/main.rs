@@ -1,6 +1,7 @@
 mod api;
 mod config;
 mod db;
+mod logging;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -13,6 +14,10 @@ use crate::db::Database;
 
 #[tokio::main]
 async fn main() {
+    // Log a fichero desde el primer momento: como tarea programada o servicio,
+    // stderr no lo recoge nadie y sin esto no queda traza de nada.
+    logging::init(Some(&logging::default_log_path()));
+
     let bootstrap = load_bootstrap("config.toml");
     let db = Arc::new(Mutex::new(
         Database::open(&bootstrap.db_path).expect("could not open sqlite database"),
@@ -40,7 +45,7 @@ async fn main() {
             }
         }
     };
-    eprintln!("monitor-agent-remote: sqlite at {}", bootstrap.db_path);
+    crate::log_info!("sqlite at {}", bootstrap.db_path);
 
     let settings = Arc::new(RwLock::new(Settings {
         listen,
@@ -57,7 +62,7 @@ async fn main() {
     tokio::spawn(retention_worker(db, settings));
 
     tokio::signal::ctrl_c().await.expect("ctrl_c handler");
-    eprintln!("monitor-agent-remote: shutting down");
+    crate::log_info!("shutting down");
     let _ = stop_tx.send(true);
 }
 
@@ -77,10 +82,10 @@ async fn retention_worker(db: Arc<Mutex<Database>>, settings: Arc<RwLock<Setting
         match db.purge_expired(&retention) {
             Ok(n) => {
                 if n > 0 {
-                    eprintln!("monitor-agent-remote: retención: purgadas {n} filas");
+                    crate::log_info!("retención: purgadas {n} filas");
                 }
             }
-            Err(e) => eprintln!("monitor-agent-remote: retención falló: {e}"),
+            Err(e) => crate::log_error!("retención falló: {e}"),
         }
     }
 }
@@ -97,7 +102,7 @@ async fn serve_loop(
         let listener = match tokio::net::TcpListener::bind(addr).await {
             Ok(l) => l,
             Err(e) => {
-                eprintln!("monitor-agent-remote: could not bind {addr}: {e}");
+                crate::log_error!("could not bind {addr}: {e}");
                 if first_bind {
                     std::process::exit(1);
                 }
@@ -107,7 +112,7 @@ async fn serve_loop(
             }
         };
         first_bind = false;
-        eprintln!("monitor-agent-remote: listening on {addr}");
+        crate::log_info!("listening on {addr}");
 
         // No se clonan los receivers aquí: un clon recién creado devuelve
         // `changed()` de inmediato (busy-loop). Se mueven dentro del select.
@@ -118,7 +123,7 @@ async fn serve_loop(
         }
 
         if *stop_rx.borrow() {
-            eprintln!("monitor-agent-remote: shutting down");
+            crate::log_info!("shutting down");
             return;
         }
         // listen cambió o el server murió: rebind en el siguiente ciclo.

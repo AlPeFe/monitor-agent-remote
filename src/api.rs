@@ -129,7 +129,7 @@ async fn agents_handler(State(state): State<ApiState>) -> Result<Json<Vec<AgentR
     let mut agents = {
         let db = state.db.lock().await;
         db.list_agents().map_err(|e| {
-            eprintln!("monitor-agent-remote: list agents failed: {e}");
+            crate::log_error!("list agents failed: {e}");
             StatusCode::INTERNAL_SERVER_ERROR
         })?
     };
@@ -182,7 +182,7 @@ async fn agent_events_handler(
     let limit = query.limit.unwrap_or(100).clamp(1, 500);
     let db = state.db.lock().await;
     db.agent_events(&agent_id, limit).map(Json).map_err(|e| {
-        eprintln!("monitor-agent-remote: agent events failed: {e}");
+        crate::log_error!("agent events failed: {e}");
         StatusCode::INTERNAL_SERVER_ERROR
     })
 }
@@ -194,7 +194,7 @@ async fn agent_checks_handler(
 ) -> Result<Json<Vec<AgentCheck>>, StatusCode> {
     let db = state.db.lock().await;
     db.list_agent_checks(&agent_id).map(Json).map_err(|e| {
-        eprintln!("monitor-agent-remote: agent checks failed: {e}");
+        crate::log_error!("agent checks failed: {e}");
         StatusCode::INTERNAL_SERVER_ERROR
     })
 }
@@ -203,7 +203,7 @@ async fn agent_checks_handler(
 async fn alerts_handler(State(state): State<ApiState>) -> Result<Json<Vec<EventRow>>, StatusCode> {
     let db = state.db.lock().await;
     db.active_alerts().map(Json).map_err(|e| {
-        eprintln!("monitor-agent-remote: active alerts failed: {e}");
+        crate::log_error!("active alerts failed: {e}");
         StatusCode::INTERNAL_SERVER_ERROR
     })
 }
