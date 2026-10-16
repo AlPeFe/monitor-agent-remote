@@ -3,6 +3,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
+use crate::alert::AlertSettings;
+
 /// Contrato del webhook enviado por monitor-agent (POST /api/ingest).
 #[derive(Debug, Clone, Deserialize)]
 pub struct IngestPayload {
@@ -47,6 +49,80 @@ pub struct CheckSnapshot {
     pub message: String,
     #[serde(default)]
     pub value: Option<f64>,
+}
+
+/// Estado persistido del aviso de "servidor sin señales".
+#[derive(Debug, Clone, PartialEq)]
+pub struct OfflineAlertRow {
+    pub agent_id: String,
+    /// Cuándo se detectó la caída (para el mensaje del correo).
+    pub since: i64,
+    /// Último aviso ENVIADO con éxito (0 = pendiente).
+    pub last_sent_at: i64,
+    /// Backoff tras un fallo de envío.
+    pub retry_after: i64,
+}
+
+/// Qué hacer con cada servidor en un ciclo del watchdog.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OfflineAction {
+    /// Primera detección de la caída o reintento de un aviso que no salió.
+    NotifyDown { agent_id: String, since: i64 },
+    /// Recordatorio mientras sigue caído.
+    RenotifyDown { agent_id: String, since: i64 },
+    /// El servidor ha vuelto.
+    NotifyUp { agent_id: String, since: i64 },
+}
+
+/// Decide los avisos de caída/recuperación de servidores.
+///
+/// Función pura (sin BD ni SMTP) para poder probarla: recibe el último
+/// `last_seen` de cada agente y el estado persistido de los avisos.
+pub fn decide_offline_alerts(
+    agents: &[(String, i64)],
+    state: &[OfflineAlertRow],
+    now: i64,
+    offline_seconds: i64,
+    cooldown_seconds: i64,
+) -> Vec<OfflineAction> {
+    let mut acciones = Vec::new();
+    for (agent_id, last_seen) in agents {
+        let row = state.iter().find(|r| &r.agent_id == agent_id);
+        // offline_minutes = 0 significa "no vigilar caídas por falta de señales".
+        let offline =
+            *last_seen > 0 && offline_seconds > 0 && now.saturating_sub(*last_seen) > offline_seconds;
+        match (offline, row) {
+            (true, None) => acciones.push(OfflineAction::NotifyDown {
+                agent_id: agent_id.clone(),
+                since: now,
+            }),
+            (true, Some(r)) => {
+                if now < r.retry_after {
+                    continue; // backoff: el envío anterior falló hace poco
+                }
+                if r.last_sent_at == 0 {
+                    // Aviso pendiente (falló el envío o el proceso murió antes).
+                    acciones.push(OfflineAction::NotifyDown {
+                        agent_id: agent_id.clone(),
+                        since: r.since,
+                    });
+                } else if cooldown_seconds > 0
+                    && now.saturating_sub(r.last_sent_at) >= cooldown_seconds
+                {
+                    acciones.push(OfflineAction::RenotifyDown {
+                        agent_id: agent_id.clone(),
+                        since: r.since,
+                    });
+                }
+            }
+            (false, Some(r)) => acciones.push(OfflineAction::NotifyUp {
+                agent_id: agent_id.clone(),
+                since: r.since,
+            }),
+            (false, None) => {}
+        }
+    }
+    acciones
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -173,7 +249,17 @@ impl Database {
                token  TEXT,
                retention_events_days    INTEGER NOT NULL DEFAULT 30,
                retention_alerts_hours   INTEGER NOT NULL DEFAULT 168,
-               retention_offline_minutes INTEGER NOT NULL DEFAULT 5
+               retention_offline_minutes INTEGER NOT NULL DEFAULT 5,
+               alert_json TEXT NOT NULL DEFAULT ''
+             );
+
+             -- Estado del aviso de servidor-sin-senales: que servidores estan
+             -- caidos y a quien se le aviso ya (sobrevive a reinicios).
+             CREATE TABLE IF NOT EXISTS offline_alerts (
+               agent_id     TEXT PRIMARY KEY,
+               since        INTEGER NOT NULL,
+               last_sent_at INTEGER NOT NULL DEFAULT 0,
+               retry_after  INTEGER NOT NULL DEFAULT 0
              );",
         )?;
 
@@ -193,6 +279,18 @@ impl Database {
                 "ALTER TABLE settings ADD COLUMN retention_events_days INTEGER NOT NULL DEFAULT 30;
                  ALTER TABLE settings ADD COLUMN retention_alerts_hours INTEGER NOT NULL DEFAULT 168;
                  ALTER TABLE settings ADD COLUMN retention_offline_minutes INTEGER NOT NULL DEFAULT 5;",
+            )?;
+        }
+        // Migración idempotente de la columna de alertas (0.2.5+).
+        let alert_col: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('settings') WHERE name = 'alert_json'",
+            [],
+            |r| r.get(0),
+        )?;
+        if alert_col == 0 {
+            conn.execute(
+                "ALTER TABLE settings ADD COLUMN alert_json TEXT NOT NULL DEFAULT ''",
+                [],
             )?;
         }
         Ok(Self { conn })
@@ -238,6 +336,92 @@ impl Database {
                 },
             )
             .unwrap_or_else(|_| Retention::default())
+    }
+
+    /// Lee la configuración de alertas por correo (JSON en `settings`).
+    pub fn get_alert_settings(&self) -> AlertSettings {
+        self.conn
+            .query_row(
+                "SELECT alert_json FROM settings WHERE key = 'default'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .ok()
+            .and_then(|json| serde_json::from_str::<AlertSettings>(&json).ok())
+            .unwrap_or_default()
+    }
+
+    /// Guarda la configuración de alertas por correo.
+    pub fn set_alert_settings(&mut self, alert: &AlertSettings) -> rusqlite::Result<()> {
+        let json = serde_json::to_string(alert)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        self.conn.execute(
+            "INSERT INTO settings (key, listen, token, alert_json) VALUES ('default', '', NULL, ?1)
+             ON CONFLICT(key) DO UPDATE SET alert_json = excluded.alert_json",
+            params![json],
+        )?;
+        Ok(())
+    }
+
+    // ------------------------------------------------ avisos de servidor caído
+
+    pub fn list_offline_alerts(&self) -> rusqlite::Result<Vec<OfflineAlertRow>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT agent_id, since, last_sent_at, retry_after FROM offline_alerts")?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(OfflineAlertRow {
+                    agent_id: r.get(0)?,
+                    since: r.get(1)?,
+                    last_sent_at: r.get(2)?,
+                    retry_after: r.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Marca un servidor como "caído y pendiente de avisar" (sin tocar el
+    /// estado si ya lo estaba).
+    pub fn insert_offline_alert(&mut self, agent_id: &str, since: i64) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO offline_alerts (agent_id, since, last_sent_at, retry_after)
+             VALUES (?1, ?2, 0, 0)",
+            params![agent_id, since],
+        )?;
+        Ok(())
+    }
+
+    /// El aviso salió: guarda cuándo (para el cooldown) y limpia el backoff.
+    pub fn mark_offline_alert_sent(&mut self, agent_id: &str, ts: i64) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE offline_alerts SET last_sent_at = ?2, retry_after = 0 WHERE agent_id = ?1",
+            params![agent_id, ts],
+        )?;
+        Ok(())
+    }
+
+    /// No se pudo enviar: no se reintenta antes de `retry_after`.
+    pub fn mark_offline_alert_error(
+        &mut self,
+        agent_id: &str,
+        retry_after: i64,
+    ) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "UPDATE offline_alerts SET retry_after = ?2 WHERE agent_id = ?1",
+            params![agent_id, retry_after],
+        )?;
+        Ok(())
+    }
+
+    /// El servidor ha vuelto: olvida su aviso de caída.
+    pub fn delete_offline_alert(&mut self, agent_id: &str) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "DELETE FROM offline_alerts WHERE agent_id = ?1",
+            params![agent_id],
+        )?;
+        Ok(())
     }
 
     /// Guarda la política de retención (UPSERT sobre la fila 'default').
@@ -782,6 +966,117 @@ mod tests {
             message: "snapshot".to_string(),
             value: Some(1.5),
         }
+    }
+
+    fn fila(agent: &str, since: i64, sent: i64, retry: i64) -> OfflineAlertRow {
+        OfflineAlertRow {
+            agent_id: agent.to_string(),
+            since,
+            last_sent_at: sent,
+            retry_after: retry,
+        }
+    }
+
+    #[test]
+    fn avisa_cuando_un_servidor_deja_de_dar_senales() {
+        let agents = vec![("srv-01".to_string(), 1_000)];
+        // 5 minutos sin señales (300s), comprobado 400s después.
+        let acciones = decide_offline_alerts(&agents, &[], 1_400, 300, 900);
+        assert_eq!(
+            acciones,
+            vec![OfflineAction::NotifyDown { agent_id: "srv-01".to_string(), since: 1_400 }]
+        );
+        // Justo en el límite todavía no es "caído".
+        assert!(decide_offline_alerts(&agents, &[], 1_300, 300, 900).is_empty());
+    }
+
+    #[test]
+    fn reavisa_por_cooldown_y_respeta_el_backoff() {
+        let agents = vec![("srv-01".to_string(), 1_000)];
+        let estado = vec![fila("srv-01", 1_400, 1_500, 0)];
+        // 800s después del primer aviso, cooldown 900 -> aún no.
+        assert!(decide_offline_alerts(&agents, &estado, 2_300, 300, 900).is_empty());
+        // Cooldown vencido -> recordatorio.
+        assert_eq!(
+            decide_offline_alerts(&agents, &estado, 2_400, 300, 900),
+            vec![OfflineAction::RenotifyDown { agent_id: "srv-01".to_string(), since: 1_400 }]
+        );
+        // Cooldown 0 = sólo el primer correo.
+        assert!(decide_offline_alerts(&agents, &estado, 99_999, 300, 0).is_empty());
+        // Tras un fallo de envío se respeta el backoff.
+        let con_backoff = vec![fila("srv-01", 1_400, 0, 2_000)];
+        assert!(decide_offline_alerts(&agents, &con_backoff, 1_900, 300, 900).is_empty());
+        assert_eq!(
+            decide_offline_alerts(&agents, &con_backoff, 2_100, 300, 900),
+            vec![OfflineAction::NotifyDown { agent_id: "srv-01".to_string(), since: 1_400 }],
+            "el aviso pendiente se reintenta cuando vence el backoff"
+        );
+    }
+
+    #[test]
+    fn avisa_de_la_recuperacion_y_no_duplica() {
+        let estado = vec![fila("srv-01", 1_400, 1_500, 0)];
+        let vivo = vec![("srv-01".to_string(), 9_000)];
+        assert_eq!(
+            decide_offline_alerts(&vivo, &estado, 9_000, 300, 900),
+            vec![OfflineAction::NotifyUp { agent_id: "srv-01".to_string(), since: 1_400 }]
+        );
+        // Sin estado previo, un servidor sano no genera nada.
+        assert!(decide_offline_alerts(&vivo, &[], 9_000, 300, 900).is_empty());
+        // Y estando caído, mientras esté dentro del cooldown, tampoco.
+        let caido = vec![("srv-01".to_string(), 1_000)];
+        assert!(decide_offline_alerts(&caido, &estado, 1_600, 300, 900).is_empty());
+        // offline_minutes = 0 -> nunca se considera caído (y se "recupera").
+        assert_eq!(
+            decide_offline_alerts(&caido, &estado, 9_999, 0, 900),
+            vec![OfflineAction::NotifyUp { agent_id: "srv-01".to_string(), since: 1_400 }],
+            "con 0 desactivado, cualquier estado previo se cierra"
+        );
+    }
+
+    #[test]
+    fn las_alertas_se_persisten_y_sobreviven_al_reinicio() {
+        let dir = std::env::temp_dir().join(format!(
+            "mar_alertas_test_{}.db",
+            std::process::id()
+        ));
+        let path = dir.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut db = Database::open(&path).expect("open");
+            db.set_settings("127.0.0.1:9600", None).expect("settings");
+            let cfg = AlertSettings {
+                enabled: true,
+                cooldown_minutes: 0,
+                recovery_notifications: false,
+                to: vec!["ops@empresa.com".to_string()],
+                smtp: crate::alert::SmtpSettings {
+                    host: "smtp.empresa.com".to_string(),
+                    port: 465,
+                    tls: crate::alert::AlertTls::Implicit,
+                    username: String::new(),
+                    password: String::new(),
+                    from: "alertas@empresa.com".to_string(),
+                },
+            };
+            db.set_alert_settings(&cfg).expect("guardar alertas");
+            db.insert_offline_alert("srv-01", 1_000).expect("marca");
+            db.mark_offline_alert_sent("srv-01", 1_100).expect("enviado");
+        }
+        // "Reinicio": se vuelve a abrir la misma base.
+        let db = Database::open(&path).expect("reopen");
+        let cfg = db.get_alert_settings();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.cooldown_minutes, 0);
+        assert!(!cfg.recovery_notifications);
+        assert_eq!(cfg.smtp.tls, crate::alert::AlertTls::Implicit);
+        assert_eq!(cfg.smtp.port, 465);
+        let estado = db.list_offline_alerts().expect("estado");
+        assert_eq!(estado.len(), 1);
+        assert_eq!(estado[0].last_sent_at, 1_100, "no se re-avisa tras reiniciar");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}-wal"));
+        let _ = std::fs::remove_file(format!("{path}-shm"));
     }
 
     #[test]

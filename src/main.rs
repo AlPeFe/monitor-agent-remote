@@ -1,7 +1,9 @@
+mod alert;
 mod api;
 mod config;
 mod db;
 mod logging;
+mod watchdog;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -25,13 +27,14 @@ async fn main() {
 
     // Lee la configuración persistida; si es la primera vez, la siembra
     // desde el bootstrap (o desde los valores por defecto).
-    let (listen, token, retention) = {
+    let (listen, token, retention, alert) = {
         let mut db = db.lock().await;
         match db.get_settings().expect("read settings") {
             Some((listen, token)) => {
                 let addr: SocketAddr = listen.parse().expect("stored listen is invalid");
                 let retention = db.get_retention();
-                (addr, token, retention)
+                let alert = db.get_alert_settings();
+                (addr, token, retention, alert)
             }
             None => {
                 let addr = bootstrap
@@ -41,7 +44,8 @@ async fn main() {
                 db.set_settings(&addr.to_string(), token.as_deref())
                     .expect("seed settings");
                 let retention = db.get_retention();
-                (addr, token, retention)
+                let alert = db.get_alert_settings();
+                (addr, token, retention, alert)
             }
         }
     };
@@ -51,6 +55,7 @@ async fn main() {
         listen,
         token,
         retention,
+        alert,
     }));
 
     let (listen_tx, listen_rx) = watch::channel(listen);
@@ -59,7 +64,9 @@ async fn main() {
     let app = api::router(db.clone(), settings.clone(), bootstrap.db_path, listen_tx);
 
     tokio::spawn(serve_loop(app, listen_rx, stop_rx));
-    tokio::spawn(retention_worker(db, settings));
+    tokio::spawn(retention_worker(db.clone(), settings.clone()));
+    // Watchdog de servidores sin señales (avisos por correo).
+    tokio::spawn(watchdog::run(db, settings));
 
     tokio::signal::ctrl_c().await.expect("ctrl_c handler");
     crate::log_info!("shutting down");

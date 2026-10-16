@@ -361,6 +361,64 @@ b.ev.crit { color: var(--crit-text); }
         </div>
       </div>
 
+      <h3 class="section-title">Alertas por correo (servidor caído)</h3>
+      <p class="hint">La central avisa cuando un servidor deja de enviar señales (apagado, servicio parado, sin red) y cuando vuelve. El agente de ese servidor ya no puede avisar en ese caso.</p>
+      <div class="field">
+        <label><input id="cfg-al-enabled" type="checkbox"> activadas</label>
+      </div>
+      <div class="retention-row">
+        <div class="field">
+          <label>destinatarios (separados por coma)</label>
+          <input id="cfg-al-to" type="text" placeholder="ops@empresa.com">
+        </div>
+        <div class="field">
+          <label>re-aviso cada (min)</label>
+          <input id="cfg-al-cooldown" type="number" min="0" placeholder="15">
+          <p class="hint">0 = sólo el primer correo</p>
+        </div>
+      </div>
+      <div class="field">
+        <label><input id="cfg-al-recovery" type="checkbox"> avisar también cuando se recupera</label>
+      </div>
+      <div class="retention-row">
+        <div class="field">
+          <label>SMTP host</label>
+          <input id="cfg-al-host" type="text" placeholder="smtp.empresa.com">
+        </div>
+        <div class="field">
+          <label>puerto</label>
+          <input id="cfg-al-port" type="number" placeholder="587">
+        </div>
+      </div>
+      <div class="retention-row">
+        <div class="field">
+          <label>tls</label>
+          <select id="cfg-al-tls">
+            <option value="starttls">starttls (587)</option>
+            <option value="implicit">implicit (465)</option>
+            <option value="none">none (relay interno)</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>usuario</label>
+          <input id="cfg-al-user" type="text" placeholder="vacío = SMTP sin AUTH">
+        </div>
+      </div>
+      <div class="retention-row">
+        <div class="field">
+          <label>password</label>
+          <input id="cfg-al-pass" type="password" placeholder="o env:SMTP_PASSWORD">
+        </div>
+        <div class="field">
+          <label>from</label>
+          <input id="cfg-al-from" type="text" placeholder="alertas@empresa.com">
+        </div>
+      </div>
+      <div class="actions">
+        <button class="btn" id="cfg-al-test">enviar correo de prueba</button>
+        <span class="hint" id="cfg-al-msg"></span>
+      </div>
+
       <div class="actions">
         <button class="btn primary" id="cfg-save">save</button>
         <span class="hint">token applies immediately</span>
@@ -652,6 +710,18 @@ b.ev.crit { color: var(--crit-text); }
       document.getElementById('cfg-ret-events').value = r.events_days != null ? r.events_days : 30;
       document.getElementById('cfg-ret-alerts').value = r.alerts_hours != null ? r.alerts_hours : 168;
       document.getElementById('cfg-ret-offline').value = r.offline_minutes != null ? r.offline_minutes : 5;
+      var al = s.alert || {};
+      var smtp = al.smtp || {};
+      document.getElementById('cfg-al-enabled').checked = !!al.enabled;
+      document.getElementById('cfg-al-to').value = (al.to || []).join(', ');
+      document.getElementById('cfg-al-cooldown').value = al.cooldown_minutes != null ? al.cooldown_minutes : 15;
+      document.getElementById('cfg-al-recovery').checked = al.recovery_notifications !== false;
+      document.getElementById('cfg-al-host').value = smtp.host || '';
+      document.getElementById('cfg-al-port').value = smtp.port || 587;
+      document.getElementById('cfg-al-tls').value = smtp.tls || 'starttls';
+      document.getElementById('cfg-al-user').value = smtp.username || '';
+      document.getElementById('cfg-al-pass').value = smtp.password || '';
+      document.getElementById('cfg-al-from').value = smtp.from || '';
     } catch (e) { setBanner('settings fetch failed: ' + e); }
   }
   async function saveSettings() {
@@ -668,7 +738,7 @@ b.ev.crit { color: var(--crit-text); }
       var res = await fetch('/api/settings', {
         method: 'PUT',
         headers: authHeaders({ 'Content-Type': 'application/json' }),
-        body: JSON.stringify({ listen: listen, token: token, retention: retention }),
+        body: JSON.stringify({ listen: listen, token: token, retention: retention, alert: collectAlert() }),
       });
       var data = await res.json();
       if (res.status === 401) {
@@ -687,6 +757,42 @@ b.ev.crit { color: var(--crit-text); }
     }
     btn.disabled = false; btn.textContent = 'save';
   }
+  function collectAlert() {
+    var co = parseInt(document.getElementById('cfg-al-cooldown').value, 10);
+    return {
+      enabled: document.getElementById('cfg-al-enabled').checked,
+      cooldown_minutes: Number.isFinite(co) && co >= 0 ? co : 15,
+      recovery_notifications: document.getElementById('cfg-al-recovery').checked,
+      to: document.getElementById('cfg-al-to').value.split(',').map(function (s) { return s.trim(); }).filter(Boolean),
+      smtp: {
+        host: document.getElementById('cfg-al-host').value.trim(),
+        port: parseInt(document.getElementById('cfg-al-port').value, 10) || 587,
+        tls: document.getElementById('cfg-al-tls').value,
+        username: document.getElementById('cfg-al-user').value.trim(),
+        password: document.getElementById('cfg-al-pass').value.trim(),
+        from: document.getElementById('cfg-al-from').value.trim(),
+      },
+    };
+  }
+  function setAlertMsg(m, kind) {
+    var el = document.getElementById('cfg-al-msg');
+    el.textContent = m || '';
+    el.style.color = kind === 'err' ? 'var(--crit-text)' : 'var(--ok-text)';
+  }
+  async function testAlert() {
+    var a = collectAlert();
+    setAlertMsg('enviando…');
+    try {
+      var res = await fetch('/api/alert/test', {
+        method: 'POST',
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ smtp: a.smtp, to: a.to }),
+      });
+      var data = await res.json().catch(function () { return {}; });
+      if (res.ok) setAlertMsg('correo de prueba enviado ✔');
+      else setAlertMsg((data && data.error) || ('error ' + res.status), 'err');
+    } catch (e) { setAlertMsg('error de red: ' + e, 'err'); }
+  }
   function copyIngest() {
     var v = document.getElementById('cfg-ingest').value;
     navigator.clipboard.writeText(v).then(function () {
@@ -699,6 +805,7 @@ b.ev.crit { color: var(--crit-text); }
   document.getElementById('settings-close').addEventListener('click', toggleSettings);
   document.getElementById('cfg-copy').addEventListener('click', copyIngest);
   document.getElementById('cfg-save').addEventListener('click', saveSettings);
+  document.getElementById('cfg-al-test').addEventListener('click', testAlert);
 
   setAccessToken(getAccessToken());
   refresh();

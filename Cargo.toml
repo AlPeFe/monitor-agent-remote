@@ -1,6 +1,6 @@
 [package]
 name = "monitor-agent-remote"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2024"
 description = "Receptor remoto de avisos de monitor-agent con panel web y almacenamiento SQLite"
 
@@ -11,3 +11,4 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 rusqlite = { version = "0.31", features = ["bundled"] }
+lettre = { version = "0.11", default-features = false, features = ["tokio1-rustls", "smtp-transport", "builder", "ring", "webpki-roots"] }

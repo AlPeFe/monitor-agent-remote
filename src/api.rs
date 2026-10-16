@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, RwLock, watch};
 
+use crate::alert::AlertSettings;
 use crate::config::Settings;
 use crate::db::{AgentCheck, AgentRow, Database, EventRow, IngestPayload, Retention};
 
@@ -38,6 +39,9 @@ pub struct SettingsUpdate {
     /// Retención opcional: si se envía, se persiste y aplica.
     #[serde(default)]
     pub retention: Option<Retention>,
+    /// Alertas por correo opcionales: si se envían, se persisten y aplican.
+    #[serde(default)]
+    pub alert: Option<AlertSettings>,
 }
 
 #[derive(Debug, Serialize)]
@@ -69,6 +73,7 @@ pub fn router(
             "/api/settings",
             get(get_settings_handler).put(update_settings_handler),
         )
+        .route("/api/alert/test", post(test_alert_handler))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_settings_auth,
@@ -261,6 +266,7 @@ async fn get_settings_handler(State(state): State<ApiState>) -> Json<Value> {
         "db_path": state.db_path,
         "ingest_url": format!("http://{}/api/ingest", s.listen),
         "retention": s.retention,
+        "alert": s.alert,
     }))
 }
 
@@ -284,6 +290,11 @@ async fn update_settings_handler(
     } else {
         Some(update.token)
     };
+    if let Some(alerta) = &update.alert
+        && let Err(e) = alerta.validate()
+    {
+        return Err((StatusCode::BAD_REQUEST, Json(json!({ "ok": false, "error": e }))));
+    }
 
     {
         let mut db = state.db.lock().await;
@@ -301,6 +312,14 @@ async fn update_settings_handler(
                 )
             })?;
         }
+        if let Some(alerta) = &update.alert {
+            db.set_alert_settings(alerta).map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "ok": false, "error": e.to_string() })),
+                )
+            })?;
+        }
     }
     {
         let mut s = state.settings.write().await;
@@ -308,6 +327,9 @@ async fn update_settings_handler(
         s.token = token.clone();
         if let Some(retention) = update.retention {
             s.retention = retention;
+        }
+        if let Some(alerta) = &update.alert {
+            s.alert = alerta.clone();
         }
     }
 
@@ -327,6 +349,38 @@ async fn update_settings_handler(
         "listen": addr.to_string(),
         "token": token.unwrap_or_default(),
         "retention": s.retention,
+        "alert": s.alert,
         "rebound": rebound,
     })))
+}
+
+/// POST /api/alert/test — envía un correo de prueba con la configuración dada.
+#[derive(Debug, Deserialize)]
+struct TestAlertRequest {
+    smtp: crate::alert::SmtpSettings,
+    to: Vec<String>,
+}
+
+async fn test_alert_handler(
+    Json(req): Json<TestAlertRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if req.to.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "faltan destinatarios para la prueba" })),
+        ));
+    }
+    if req.smtp.host.trim().is_empty() || req.smtp.from.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "faltan host o remitente (from)" })),
+        ));
+    }
+    match crate::watchdog::send_test(&req.smtp, &req.to).await {
+        Ok(()) => Ok(Json(json!({ "ok": true, "message": "correo de prueba enviado" }))),
+        Err(e) => Err((
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "ok": false, "error": format!("SMTP: {e}") })),
+        )),
+    }
 }

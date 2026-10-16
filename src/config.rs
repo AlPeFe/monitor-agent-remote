@@ -3,6 +3,8 @@ use std::net::SocketAddr;
 
 use serde::{Deserialize, Serialize};
 
+use crate::alert::AlertSettings;
+
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:9600";
 pub const DEFAULT_DB_PATH: &str = "monitor.db";
 
@@ -50,4 +52,8 @@ pub struct Settings {
     /// minutos de offline). Se persiste en `settings` y la aplica el worker.
     #[serde(default)]
     pub retention: crate::db::Retention,
+    /// Alertas por correo de la central (servidor sin señales). Se persiste en
+    /// `settings.alert_json` y la aplica el watchdog.
+    #[serde(default)]
+    pub alert: AlertSettings,
 }
