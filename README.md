@@ -61,7 +61,7 @@ Campos gestionables desde la web:
 | `token`       | Opcional. Si se define, `/api/ingest` exige `Authorization: Bearer <token>`.|
 | `db_path`     | Solo lectura (elegida antes del primer arranque).                           |
 | `ingest_url`  | URL que deben apuntar los `[exporter]` de los agentes.                      |
-| `retention`   | Retención de datos: días de eventos, horas de incidencias activas y minutos para marcar un servidor offline. La purga se aplica cada hora; el estado offline, en vivo (0 = indefinido). |
+| `retention`   | Retención de datos: días de eventos (`events_days`), horas de incidencias activas (`alerts_hours`), minutos para marcar un servidor offline (`offline_minutes`) y días de historial de uptime por hora (`history_days`, 400 por defecto). La purga se aplica cada hora; el estado offline, en vivo (0 = indefinido). |
 | `alert`       | Alertas por correo de la central: avisa cuando un servidor deja de enviar señales (y cuando vuelve). Incluye `enabled`, `to[]`, `cooldown_minutes` (0 = sólo el primer correo), `recovery_notifications` y el bloque `smtp` (host, port, tls, username, password, from). Con `username` vacío no se envía AUTH. El botón "enviar correo de prueba" del panel valida la configuración. |
 
 ## Contrato del webhook
@@ -78,7 +78,8 @@ Cada **monitor-agent** hace `POST /api/ingest` con `Content-Type: application/js
 | `status`         | string          | `ok`, `warn`, `critical` o `unknown`.                            |
 | `message`        | string          | Mensaje legible de la comprobacion.                              |
 | `value`          | number?         | Valor numerico opcional.                                         |
-| `timestamp`      | number          | Unix seconds del evento.                                         |
+| `timestamp`      | number          | Unix seconds del evento (hora real del agente). Es la que usa el historial; `last_seen` es la hora de llegada. |
+| `event_id`       | string?         | Id único del evento generado por el agente. Si la central ya recibió ese `(agent_id, event_id)`, responde `200` con `"duplicate": true` y no procesa nada. Sin él, todo funciona como antes. |
 | `ok_count`       | number?         | Solo heartbeat: comprobaciones OK.                               |
 | `warn_count`     | number?         | Solo heartbeat: comprobaciones en Warning.                       |
 | `critical_count` | number?         | Solo heartbeat: comprobaciones en Critical.                      |
@@ -100,16 +101,32 @@ Ejemplo:
 }
 ```
 
-Respuesta: `200 {"ok": true, "stored": 42, "agent_id": "server-web-01"}`.
+Respuesta: `200 {"ok": true, "stored": 42, "agent_id": "server-web-01", "duplicate": false}`.
+
+Un heartbeat con `timestamp` anterior al último heartbeat aplicado de ese
+agente (un reenvío atrasado) no pisa el estado actual ni el inventario de
+checks: solo cuenta para el historial.
+
+### Lotes
+
+`POST /api/ingest/batch` recibe un array JSON con los mismos objetos que
+`/api/ingest` (máximo 500) y los aplica en orden en una sola transacción. Lo
+usa el agente para reenviar su backlog tras un corte. Exige el mismo token.
+Si algún elemento no trae `agent_id` o `event`, se rechaza el lote entero
+(`400`); con más de 500 elementos, `413`.
+
+Respuesta: `200 {"ok": true, "stored": 120, "duplicates": 3}`.
 
 ## API
 
 | Metodo | Ruta                          | Descripcion                              |
 |--------|-------------------------------|------------------------------------------|
 | POST   | `/api/ingest`                 | Recibe un evento de un agente.           |
+| POST   | `/api/ingest/batch`           | Recibe un lote de eventos (máx. 500) en una transacción. |
 | POST   | `/api/alert/test`             | Envía un correo de prueba con la config SMTP dada (exige token si lo hay). |
 | GET    | `/api/agents`                 | Estado agregado de todos los servidores. Un agente sin heartbeat dentro de `retention.offline_minutes` aparece con `status: "offline"`. |
 | GET    | `/api/agents/{id}/events`     | Historial de eventos de un servidor.     |
+| GET    | `/api/agents/{id}/uptime`     | Uptime por check. Ver abajo.             |
 | GET    | `/api/alerts`                 | Avisos activos (fail sin recover).       |
 | GET    | `/api/settings`               | Config actual (listen, token, db_path, ingest_url). Con token definido exige `Authorization: Bearer`. |
 | PUT    | `/api/settings`               | Guarda `listen` y `token` (aplica en vivo). |
@@ -119,6 +136,34 @@ Si defines `token` en la configuracion, `/api/ingest` **y** `/api/settings`
 panel (estado, agentes, alertas) sigue siendo de solo lectura y sin
 autenticación para la LAN. El navegador guarda el token de acceso en su
 `localStorage` (campo *access token* del panel de ajustes).
+
+### Uptime
+
+La central guarda, por cada check del inventario del heartbeat, cuántas
+muestras llegaron en cada hora y cuántas estaban en `ok` (hora del
+`timestamp` del heartbeat). Se conservan `retention.history_days` días.
+
+`GET /api/agents/{id}/uptime` devuelve `404` si el agente no existe y, si no,
+`{agent_id, now, hour_ts, history_start, no_data_hours, checks: [...]}`.
+Cada check trae:
+
+- `uptime`: objetos `24h`, `7d`, `30d` y `365d` con `pct` (ok/total en %,
+  truncado a 2 decimales; `null` si no hay muestras), `total`, `ok` y
+  `no_data_hours`. Cada rango cuenta la hora actual, aunque esté a medias.
+- `hours`: las últimas 48 horas, de la más antigua a la actual, con
+  `hour_ts`, `total`, `ok`, `worst` (peor estado de la hora, `null` sin
+  muestras) y `no_data`.
+
+Una hora "sin datos" es una hora en la que el agente no mandó ningún
+heartbeat (servidor apagado, servicio parado, sin red). Se cuentan desde la
+primera hora con historial del agente (`history_start`; si aún no tiene,
+desde `first_seen`). No entran en el porcentaje: se devuelven aparte en
+`no_data_hours` y el panel las pinta en gris y como "3 h sin datos" junto al
+porcentaje.
+- `incidents`: hasta 50 pares fail → recover sacados de `events`, la más
+  reciente primero, con `start`, `end` (`null` si sigue abierta),
+  `duration_seconds` (hasta ahora si sigue abierta), `status` y `message`.
+  Solo cubren lo que queda en `events` (`retention.events_days`).
 
 ## Log
 

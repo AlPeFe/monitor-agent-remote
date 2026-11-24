@@ -36,6 +36,20 @@ pub struct IngestPayload {
     /// Los agentes anteriores no lo mandan (queda vacío y no se toca nada).
     #[serde(default)]
     pub checks: Vec<CheckSnapshot>,
+    /// Identificador único del evento generado por el agente (idempotencia).
+    /// Si llega dos veces el mismo (agent_id, event_id) el segundo no se
+    /// procesa. Los agentes antiguos no lo mandan: se comportan como siempre.
+    #[serde(default)]
+    pub event_id: Option<String>,
+}
+
+/// Resultado de ingerir un evento.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct IngestOutcome {
+    /// Id de la fila en `events` (0 si no se guarda como evento o es duplicado).
+    pub id: i64,
+    /// Ya se había ingerido un evento con el mismo (agent_id, event_id).
+    pub duplicate: bool,
 }
 
 /// Una comprobación dentro del inventario del heartbeat.
@@ -168,6 +182,95 @@ pub struct AgentCheck {
     pub ts: i64,
 }
 
+/// Uptime de un check en un rango (24h, 7d...): ok/total sobre los cubos
+/// horarios. `pct` es None si no hay ninguna muestra en el rango.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct UptimeRange {
+    pub pct: Option<f64>,
+    pub total: i64,
+    pub ok: i64,
+    /// Horas del rango en las que el agente no mandó ningún heartbeat
+    /// (servidor caído o sin red). No cuentan en `pct`.
+    pub no_data_hours: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct UptimeRanges {
+    #[serde(rename = "24h")]
+    pub h24: UptimeRange,
+    #[serde(rename = "7d")]
+    pub d7: UptimeRange,
+    #[serde(rename = "30d")]
+    pub d30: UptimeRange,
+    #[serde(rename = "365d")]
+    pub d365: UptimeRange,
+}
+
+/// Un cubo de una hora para la barra de estado (total = 0: sin muestras).
+#[derive(Debug, Clone, Serialize)]
+pub struct HourBucket {
+    pub hour_ts: i64,
+    pub total: i64,
+    pub ok: i64,
+    pub worst: Option<String>,
+    /// Hora sin ningún heartbeat del agente desde que hay historial.
+    pub no_data: bool,
+}
+
+/// Incidencia fail -> recover de un check (end = None: sigue abierta).
+#[derive(Debug, Clone, Serialize)]
+pub struct Incident {
+    pub start: i64,
+    pub end: Option<i64>,
+    pub duration_seconds: i64,
+    /// Peor estado visto durante la incidencia.
+    pub status: String,
+    /// Mensaje del primer fail.
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CheckUptime {
+    pub check_type: String,
+    pub target: String,
+    pub uptime: UptimeRanges,
+    /// Últimas 48 horas, de la más antigua a la actual.
+    pub hours: Vec<HourBucket>,
+    /// Últimas 50 incidencias, la más reciente primero.
+    pub incidents: Vec<Incident>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentUptime {
+    pub agent_id: String,
+    pub now: i64,
+    /// Inicio de la hora actual (último cubo de `hours`).
+    pub hour_ts: i64,
+    /// Primera hora desde la que se cuentan las horas sin datos (None: el
+    /// agente aún no tiene historial).
+    pub history_start: Option<i64>,
+    /// Horas sin heartbeat del agente por rango (las mismas que en cada check).
+    pub no_data_hours: NoDataHours,
+    pub checks: Vec<CheckUptime>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Default)]
+pub struct NoDataHours {
+    #[serde(rename = "24h")]
+    pub h24: i64,
+    #[serde(rename = "7d")]
+    pub d7: i64,
+    #[serde(rename = "30d")]
+    pub d30: i64,
+    #[serde(rename = "365d")]
+    pub d365: i64,
+}
+
+/// Horas de la barra de estado.
+pub const UPTIME_BAR_HOURS: i64 = 48;
+/// Incidencias devueltas por check.
+pub const UPTIME_MAX_INCIDENTS: usize = 50;
+
 /// Política de retención de datos de la central. Se persiste en `settings`
 /// y se aplica de forma periódica por el worker de purga.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -184,6 +287,14 @@ pub struct Retention {
     /// panel (por ejemplo 5 minutos con el heartbeat a 60 s). 0 = nunca.
     #[serde(default)]
     pub offline_minutes: i64,
+    /// Días de historial de uptime por hora (check_hourly / agent_hourly).
+    /// 0 = conservar indefinidamente. Si no viene (UI antigua), 400.
+    #[serde(default = "default_history_days")]
+    pub history_days: i64,
+}
+
+fn default_history_days() -> i64 {
+    400
 }
 
 impl Default for Retention {
@@ -192,6 +303,7 @@ impl Default for Retention {
             events_days: 30,
             alerts_hours: 24 * 7, // 7 días de incidencias sin recuperar
             offline_minutes: 5,
+            history_days: default_history_days(),
         }
     }
 }
@@ -211,7 +323,8 @@ impl Database {
                warn_count     INTEGER NOT NULL DEFAULT 0,
                critical_count INTEGER NOT NULL DEFAULT 0,
                last_seen      INTEGER NOT NULL DEFAULT 0,
-               first_seen     INTEGER NOT NULL DEFAULT 0
+               first_seen     INTEGER NOT NULL DEFAULT 0,
+               last_hb_ts     INTEGER NOT NULL DEFAULT 0
              );
 
              CREATE TABLE IF NOT EXISTS events (
@@ -224,7 +337,8 @@ impl Database {
                message     TEXT NOT NULL DEFAULT '',
                value       REAL,
                ts          INTEGER NOT NULL,
-               received_at INTEGER NOT NULL
+               received_at INTEGER NOT NULL,
+               event_id    TEXT
              );
 
              CREATE INDEX IF NOT EXISTS idx_events_agent_id ON events(agent_id, id DESC);
@@ -250,7 +364,8 @@ impl Database {
                retention_events_days    INTEGER NOT NULL DEFAULT 30,
                retention_alerts_hours   INTEGER NOT NULL DEFAULT 168,
                retention_offline_minutes INTEGER NOT NULL DEFAULT 5,
-               alert_json TEXT NOT NULL DEFAULT ''
+               alert_json TEXT NOT NULL DEFAULT '',
+               retention_history_days INTEGER NOT NULL DEFAULT 400
              );
 
              -- Estado del aviso de servidor-sin-senales: que servidores estan
@@ -260,7 +375,39 @@ impl Database {
                since        INTEGER NOT NULL,
                last_sent_at INTEGER NOT NULL DEFAULT 0,
                retry_after  INTEGER NOT NULL DEFAULT 0
-             );",
+             );
+
+             -- Idempotencia de los heartbeats (no se guardan en events): ids
+             -- ya vistos, se purgan a los 7 dias.
+             CREATE TABLE IF NOT EXISTS seen_events (
+               agent_id TEXT NOT NULL,
+               event_id TEXT NOT NULL,
+               ts       INTEGER NOT NULL,
+               PRIMARY KEY (agent_id, event_id)
+             ) WITHOUT ROWID;
+
+             -- Historial de estado por check en cubos de una hora (uptime).
+             -- Cada heartbeat suma 1 a total (y a ok si el check estaba ok)
+             -- en el cubo de SU timestamp. worst = peor estado visto.
+             CREATE TABLE IF NOT EXISTS check_hourly (
+               agent_id   TEXT NOT NULL,
+               check_type TEXT NOT NULL,
+               target     TEXT NOT NULL,
+               hour_ts    INTEGER NOT NULL,
+               total      INTEGER NOT NULL DEFAULT 0,
+               ok         INTEGER NOT NULL DEFAULT 0,
+               worst      TEXT NOT NULL DEFAULT 'ok',
+               PRIMARY KEY (agent_id, check_type, target, hour_ts)
+             ) WITHOUT ROWID;
+
+             -- Heartbeats recibidos por agente y hora: una hora sin fila es
+             -- una hora sin datos (servidor caido o sin red).
+             CREATE TABLE IF NOT EXISTS agent_hourly (
+               agent_id   TEXT NOT NULL,
+               hour_ts    INTEGER NOT NULL,
+               heartbeats INTEGER NOT NULL DEFAULT 0,
+               PRIMARY KEY (agent_id, hour_ts)
+             ) WITHOUT ROWID;",
         )?;
 
         // Migración idempotente: las BDs creadas por versiones anteriores
@@ -293,6 +440,29 @@ impl Database {
                 [],
             )?;
         }
+        // Migraciones idempotentes de la ingesta idempotente: event_id en
+        // events y último heartbeat aplicado por agente.
+        if !has_column(&conn, "events", "event_id")? {
+            conn.execute("ALTER TABLE events ADD COLUMN event_id TEXT", [])?;
+        }
+        if !has_column(&conn, "agents", "last_hb_ts")? {
+            conn.execute(
+                "ALTER TABLE agents ADD COLUMN last_hb_ts INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        if !has_column(&conn, "settings", "retention_history_days")? {
+            conn.execute(
+                "ALTER TABLE settings ADD COLUMN retention_history_days INTEGER NOT NULL DEFAULT 400",
+                [],
+            )?;
+        }
+        // El índice va después de la migración: necesita la columna.
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_events_event_id
+             ON events(agent_id, event_id) WHERE event_id IS NOT NULL",
+            [],
+        )?;
         Ok(Self { conn })
     }
 
@@ -324,7 +494,8 @@ impl Database {
     pub fn get_retention(&self) -> Retention {
         self.conn
             .query_row(
-                "SELECT retention_events_days, retention_alerts_hours, retention_offline_minutes
+                "SELECT retention_events_days, retention_alerts_hours, retention_offline_minutes,
+                        retention_history_days
                  FROM settings WHERE key = 'default'",
                 [],
                 |r| {
@@ -332,6 +503,7 @@ impl Database {
                         events_days: r.get(0)?,
                         alerts_hours: r.get(1)?,
                         offline_minutes: r.get(2)?,
+                        history_days: r.get(3)?,
                     })
                 },
             )
@@ -427,16 +599,18 @@ impl Database {
     /// Guarda la política de retención (UPSERT sobre la fila 'default').
     pub fn set_retention(&mut self, retention: &Retention) -> rusqlite::Result<()> {
         self.conn.execute(
-            "INSERT INTO settings (key, listen, token, retention_events_days, retention_alerts_hours, retention_offline_minutes)
-             VALUES ('default', '', NULL, ?1, ?2, ?3)
+            "INSERT INTO settings (key, listen, token, retention_events_days, retention_alerts_hours, retention_offline_minutes, retention_history_days)
+             VALUES ('default', '', NULL, ?1, ?2, ?3, ?4)
              ON CONFLICT(key) DO UPDATE SET
                retention_events_days       = excluded.retention_events_days,
                retention_alerts_hours      = excluded.retention_alerts_hours,
-               retention_offline_minutes   = excluded.retention_offline_minutes",
+               retention_offline_minutes   = excluded.retention_offline_minutes,
+               retention_history_days      = excluded.retention_history_days",
             params![
                 retention.events_days,
                 retention.alerts_hours,
-                retention.offline_minutes
+                retention.offline_minutes,
+                retention.history_days
             ],
         )?;
         Ok(())
@@ -546,27 +720,113 @@ impl Database {
             params![check_cutoff],
         )?;
 
+        // 4) Historial de uptime por hora.
+        if retention.history_days > 0 {
+            let cutoff = now - retention.history_days * 86_400;
+            deleted += self.conn.execute(
+                "DELETE FROM check_hourly WHERE hour_ts < ?1",
+                params![cutoff],
+            )?;
+            deleted += self.conn.execute(
+                "DELETE FROM agent_hourly WHERE hour_ts < ?1",
+                params![cutoff],
+            )?;
+        }
+
+        // 5) Ids de heartbeats ya vistos: basta con una semana (margen de
+        //    sobra para que un agente vacíe su backlog).
+        deleted += self.conn.execute(
+            "DELETE FROM seen_events WHERE ts < ?1",
+            params![now - 7 * 86_400],
+        )?;
+
         Ok(deleted as i64)
     }
 
+    /// Ingiere un evento dentro de su propia transacción.
+    pub fn ingest(&mut self, p: &IngestPayload) -> rusqlite::Result<IngestOutcome> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        match self.ingest_inner(p) {
+            Ok(out) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(out)
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
+    /// Ingiere un lote en orden y en una sola transacción (backlog que el
+    /// agente reenvía al recuperar la conexión). Si algo falla no se aplica
+    /// nada. Devuelve (guardados, duplicados).
+    pub fn ingest_batch(&mut self, payloads: &[IngestPayload]) -> rusqlite::Result<(i64, i64)> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let mut stored = 0;
+        let mut duplicates = 0;
+        for p in payloads {
+            match self.ingest_inner(p) {
+                Ok(out) if out.duplicate => duplicates += 1,
+                Ok(_) => stored += 1,
+                Err(e) => {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    return Err(e);
+                }
+            }
+        }
+        self.conn.execute_batch("COMMIT")?;
+        Ok((stored, duplicates))
+    }
+
+    /// ¿Ya se ingirió este (agent_id, event_id)? Mira events (fail/recover)
+    /// y seen_events (heartbeats).
+    fn is_duplicate(&self, agent_id: &str, event_id: &str) -> rusqlite::Result<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT (SELECT COUNT(*) FROM events WHERE agent_id = ?1 AND event_id = ?2)
+                  + (SELECT COUNT(*) FROM seen_events WHERE agent_id = ?1 AND event_id = ?2)",
+            params![agent_id, event_id],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
     /// Inserta el evento y actualiza el estado agregado del agente.
-    pub fn ingest(&mut self, p: &IngestPayload) -> rusqlite::Result<i64> {
+    fn ingest_inner(&mut self, p: &IngestPayload) -> rusqlite::Result<IngestOutcome> {
         let now = now_unix();
+        // Hora real del evento (la del agente): es la que alimenta el
+        // historial. last_seen sigue siendo la hora de llegada.
         let ts = p.timestamp.unwrap_or(now);
         let status = if p.status.trim().is_empty() {
             "unknown"
         } else {
             p.status.trim()
         };
+        let event_id = p
+            .event_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+
+        // Idempotencia: un reenvío del mismo evento no reprocesa nada.
+        if let Some(eid) = event_id
+            && self.is_duplicate(&p.agent_id, eid)?
+        {
+            return Ok(IngestOutcome {
+                id: 0,
+                duplicate: true,
+            });
+        }
 
         // Retención: los heartbeats NO se guardan como eventos (solo actualizan
         // el estado agregado del agente). La tabla events conserva fails y
         // recovers, que es donde está la historia que importa.
         let is_heartbeat = p.event == "heartbeat";
+        let mut id = 0;
         if !is_heartbeat {
             self.conn.execute(
-                "INSERT INTO events (agent_id, event, check_type, target, status, message, value, ts, received_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                "INSERT INTO events (agent_id, event, check_type, target, status, message, value, ts, received_at, event_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     p.agent_id,
                     p.event,
@@ -576,11 +836,17 @@ impl Database {
                     p.message,
                     p.value,
                     ts,
-                    now
+                    now,
+                    event_id
                 ],
             )?;
+            id = self.conn.last_insert_rowid();
+        } else if let Some(eid) = event_id {
+            self.conn.execute(
+                "INSERT OR IGNORE INTO seen_events (agent_id, event_id, ts) VALUES (?1, ?2, ?3)",
+                params![p.agent_id, eid, now],
+            )?;
         }
-        let id = self.conn.last_insert_rowid();
 
         let host = p.agent_host.as_deref().unwrap_or("");
         self.conn.execute(
@@ -594,6 +860,28 @@ impl Database {
 
         match p.event.as_str() {
             "heartbeat" => {
+                // Historial de uptime: cuenta en el cubo de la hora real del
+                // heartbeat, también si es un reenvío atrasado.
+                self.record_history(&p.agent_id, ts, &p.checks)?;
+                // Un heartbeat reenviado (backlog) más viejo que el último
+                // aplicado no puede pisar el estado actual con datos antiguos.
+                let last_hb_ts: i64 = self.conn.query_row(
+                    "SELECT last_hb_ts FROM agents WHERE agent_id = ?1",
+                    params![p.agent_id],
+                    |r| r.get(0),
+                )?;
+                if ts < last_hb_ts {
+                    return Ok(IngestOutcome {
+                        id,
+                        duplicate: false,
+                    });
+                }
+                // Acotado a "ahora": un reloj del agente adelantado no debe
+                // dejar fuera los heartbeats siguientes.
+                self.conn.execute(
+                    "UPDATE agents SET last_hb_ts = ?1 WHERE agent_id = ?2",
+                    params![ts.min(now), p.agent_id],
+                )?;
                 // El heartbeat refleja el resumen agregado que el agente cree
                 // tener. Pero no debe ENMASCARAR una incidencia activa: si la
                 // central aún tiene fails sin recover para este agente, su
@@ -694,7 +982,10 @@ impl Database {
             _ => {} // otros eventos (p.ej. "ok") solo se almacenan
         }
 
-        Ok(id)
+        Ok(IngestOutcome {
+            id,
+            duplicate: false,
+        })
     }
 
     fn active_alerts_for_agent(&self, agent_id: &str) -> rusqlite::Result<i64> {
@@ -718,6 +1009,43 @@ impl Database {
             )
             .optional()
             .map(|v| v.unwrap_or(0))
+    }
+
+    /// Suma el heartbeat a los cubos horarios del agente y de cada check del
+    /// inventario (hora = timestamp del heartbeat redondeado a la hora).
+    fn record_history(
+        &mut self,
+        agent_id: &str,
+        ts: i64,
+        checks: &[CheckSnapshot],
+    ) -> rusqlite::Result<()> {
+        let hour = hour_floor(ts);
+        self.conn.execute(
+            "INSERT INTO agent_hourly (agent_id, hour_ts, heartbeats) VALUES (?1, ?2, 1)
+             ON CONFLICT(agent_id, hour_ts) DO UPDATE SET heartbeats = heartbeats + 1",
+            params![agent_id, hour],
+        )?;
+        let mut stmt = self.conn.prepare_cached(
+            "INSERT INTO check_hourly (agent_id, check_type, target, hour_ts, total, ok, worst)
+             VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6)
+             ON CONFLICT(agent_id, check_type, target, hour_ts) DO UPDATE SET
+               total = total + 1,
+               ok    = ok + excluded.ok,
+               worst = CASE
+                 WHEN (CASE excluded.worst WHEN 'critical' THEN 3 WHEN 'ok' THEN 1 ELSE 2 END)
+                    > (CASE check_hourly.worst WHEN 'critical' THEN 3 WHEN 'ok' THEN 1 ELSE 2 END)
+                 THEN excluded.worst ELSE check_hourly.worst END",
+        )?;
+        for c in checks {
+            let status = if c.status.trim().is_empty() {
+                "unknown"
+            } else {
+                c.status.trim()
+            };
+            let ok = i64::from(status == "ok");
+            stmt.execute(params![agent_id, c.check_type, c.target, hour, ok, status])?;
+        }
+        Ok(())
     }
 
     /// Aplica el inventario de checks del heartbeat sobre `agent_checks`.
@@ -872,6 +1200,282 @@ impl Database {
         Ok(rows)
     }
 
+    /// Uptime por check de un agente: porcentajes 24h/7d/30d/365d, barra de
+    /// las últimas 48 horas e incidencias fail -> recover. None si el agente
+    /// no existe.
+    pub fn agent_uptime(&self, agent_id: &str, now: i64) -> rusqlite::Result<Option<AgentUptime>> {
+        let Some(first_seen) = self
+            .conn
+            .query_row(
+                "SELECT first_seen FROM agents WHERE agent_id = ?1",
+                params![agent_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+
+        let cur = hour_floor(now);
+        // Inicio de cada rango: N cubos contando la hora actual (parcial).
+        let start = |hours: i64| cur - (hours - 1) * 3600;
+        let (s24, s7, s30, s365) = (start(24), start(24 * 7), start(24 * 30), start(24 * 365));
+        let bar_start = start(UPTIME_BAR_HOURS);
+
+        // Horas sin datos: horas sin fila en agent_hourly desde que el agente
+        // tiene historial. Se cuenta desde su primera hora con heartbeats (o
+        // desde first_seen si aún no tiene ninguna): en una central que se
+        // actualiza, los agentes ya existentes tienen first_seen de hace
+        // meses pero historial desde hoy, y no serían "horas sin datos".
+        let first_hour: Option<i64> = self.conn.query_row(
+            "SELECT MIN(hour_ts) FROM agent_hourly WHERE agent_id = ?1",
+            params![agent_id],
+            |r| r.get(0),
+        )?;
+        let history_start = first_hour.or(if first_seen > 0 {
+            Some(hour_floor(first_seen))
+        } else {
+            None
+        });
+        // Horas del agente con heartbeat en los últimos 365 días.
+        let present: std::collections::HashSet<i64> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT hour_ts FROM agent_hourly
+                 WHERE agent_id = ?1 AND hour_ts >= ?2 AND hour_ts <= ?3",
+            )?;
+            stmt.query_map(params![agent_id, s365, cur], |r| r.get::<_, i64>(0))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        let no_data_since = |range_start: i64| -> i64 {
+            let Some(hs) = history_start else { return 0 };
+            let from = range_start.max(hs);
+            if from > cur {
+                return 0;
+            }
+            let expected = (cur - from) / 3600 + 1;
+            let seen = present.iter().filter(|h| **h >= from).count() as i64;
+            (expected - seen).max(0)
+        };
+        let no_data_hours = NoDataHours {
+            h24: no_data_since(s24),
+            d7: no_data_since(s7),
+            d30: no_data_since(s30),
+            d365: no_data_since(s365),
+        };
+        let is_no_data =
+            |hour_ts: i64| history_start.is_some_and(|hs| hour_ts >= hs) && !present.contains(&hour_ts);
+
+        type Key = (String, String);
+        let mut checks: std::collections::BTreeMap<Key, CheckUptime> = Default::default();
+        let entry = |checks: &mut std::collections::BTreeMap<Key, CheckUptime>,
+                     check_type: String,
+                     target: String| {
+            checks
+                .entry((check_type.clone(), target.clone()))
+                .or_insert_with(|| CheckUptime {
+                    check_type,
+                    target,
+                    uptime: UptimeRanges {
+                        h24: UptimeRange {
+                            no_data_hours: no_data_hours.h24,
+                            ..Default::default()
+                        },
+                        d7: UptimeRange {
+                            no_data_hours: no_data_hours.d7,
+                            ..Default::default()
+                        },
+                        d30: UptimeRange {
+                            no_data_hours: no_data_hours.d30,
+                            ..Default::default()
+                        },
+                        d365: UptimeRange {
+                            no_data_hours: no_data_hours.d365,
+                            ..Default::default()
+                        },
+                    },
+                    hours: (0..UPTIME_BAR_HOURS)
+                        .map(|i| {
+                            let hour_ts = bar_start + i * 3600;
+                            HourBucket {
+                                hour_ts,
+                                total: 0,
+                                ok: 0,
+                                worst: None,
+                                no_data: is_no_data(hour_ts),
+                            }
+                        })
+                        .collect(),
+                    incidents: Vec::new(),
+                });
+        };
+
+        // Checks actuales (aunque aún no tengan historial).
+        {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT check_type, target FROM agent_checks WHERE agent_id = ?1")?;
+            let rows = stmt.query_map(params![agent_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (ct, t) = row?;
+                entry(&mut checks, ct, t);
+            }
+        }
+
+        // Porcentajes: sumas por rango en una sola pasada. Las horas sin
+        // datos no tienen filas en check_hourly, así que ya quedan fuera del
+        // denominador.
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT check_type, target,
+                        SUM(CASE WHEN hour_ts >= ?2 THEN total ELSE 0 END),
+                        SUM(CASE WHEN hour_ts >= ?2 THEN ok    ELSE 0 END),
+                        SUM(CASE WHEN hour_ts >= ?3 THEN total ELSE 0 END),
+                        SUM(CASE WHEN hour_ts >= ?3 THEN ok    ELSE 0 END),
+                        SUM(CASE WHEN hour_ts >= ?4 THEN total ELSE 0 END),
+                        SUM(CASE WHEN hour_ts >= ?4 THEN ok    ELSE 0 END),
+                        SUM(total), SUM(ok)
+                 FROM check_hourly
+                 WHERE agent_id = ?1 AND hour_ts >= ?5 AND hour_ts <= ?6
+                 GROUP BY check_type, target",
+            )?;
+            let rows = stmt.query_map(params![agent_id, s24, s7, s30, s365, cur], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    [
+                        (r.get::<_, i64>(2)?, r.get::<_, i64>(3)?),
+                        (r.get::<_, i64>(4)?, r.get::<_, i64>(5)?),
+                        (r.get::<_, i64>(6)?, r.get::<_, i64>(7)?),
+                        (r.get::<_, i64>(8)?, r.get::<_, i64>(9)?),
+                    ],
+                ))
+            })?;
+            for row in rows {
+                let (ct, t, sums) = row?;
+                entry(&mut checks, ct.clone(), t.clone());
+                let c = checks.get_mut(&(ct, t)).expect("entrada recién creada");
+                let r = |(total, ok): (i64, i64), no_data_hours: i64| UptimeRange {
+                    pct: uptime_pct(ok, total),
+                    total,
+                    ok,
+                    no_data_hours,
+                };
+                c.uptime = UptimeRanges {
+                    h24: r(sums[0], no_data_hours.h24),
+                    d7: r(sums[1], no_data_hours.d7),
+                    d30: r(sums[2], no_data_hours.d30),
+                    d365: r(sums[3], no_data_hours.d365),
+                };
+            }
+        }
+
+        // Barra: últimas 48 horas.
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT check_type, target, hour_ts, total, ok, worst
+                 FROM check_hourly
+                 WHERE agent_id = ?1 AND hour_ts >= ?2 AND hour_ts <= ?3",
+            )?;
+            let rows = stmt.query_map(params![agent_id, bar_start, cur], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, String>(5)?,
+                ))
+            })?;
+            for row in rows {
+                let (ct, t, hour_ts, total, ok, worst) = row?;
+                let Some(c) = checks.get_mut(&(ct, t)) else {
+                    continue;
+                };
+                let idx = ((hour_ts - bar_start) / 3600) as usize;
+                if let Some(b) = c.hours.get_mut(idx) {
+                    b.total = total;
+                    b.ok = ok;
+                    b.worst = Some(worst);
+                }
+            }
+        }
+
+        // Incidencias: emparejar fail -> recover por check, en orden de la
+        // hora real del evento. Varios fails seguidos (p.ej. warn -> critical)
+        // son la misma incidencia.
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT check_type, target, event, status, message, ts
+                 FROM events
+                 WHERE agent_id = ?1 AND event IN ('fail', 'recover')
+                 ORDER BY ts ASC, id ASC",
+            )?;
+            let rows = stmt.query_map(params![agent_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, i64>(5)?,
+                ))
+            })?;
+            let mut open: std::collections::HashMap<Key, Incident> = Default::default();
+            for row in rows {
+                let (ct, t, event, status, message, ts) = row?;
+                let key = (ct, t);
+                if event == "fail" {
+                    match open.get_mut(&key) {
+                        Some(inc) => {
+                            if severity(&status) > severity(&inc.status) {
+                                inc.status = status;
+                            }
+                        }
+                        None => {
+                            open.insert(
+                                key,
+                                Incident {
+                                    start: ts,
+                                    end: None,
+                                    duration_seconds: 0,
+                                    status,
+                                    message,
+                                },
+                            );
+                        }
+                    }
+                } else if let Some(mut inc) = open.remove(&key) {
+                    inc.end = Some(ts);
+                    inc.duration_seconds = (ts - inc.start).max(0);
+                    if let Some(c) = checks.get_mut(&key) {
+                        c.incidents.push(inc);
+                    }
+                }
+            }
+            for (key, mut inc) in open {
+                inc.duration_seconds = (now - inc.start).max(0);
+                if let Some(c) = checks.get_mut(&key) {
+                    c.incidents.push(inc);
+                }
+            }
+            for c in checks.values_mut() {
+                c.incidents.sort_by(|a, b| b.start.cmp(&a.start));
+                c.incidents.truncate(UPTIME_MAX_INCIDENTS);
+            }
+        }
+
+        Ok(Some(AgentUptime {
+            agent_id: agent_id.to_string(),
+            now,
+            hour_ts: cur,
+            history_start,
+            no_data_hours,
+            checks: checks.into_values().collect(),
+        }))
+    }
+
     /// Avisos activos globales: último "fail" de cada (agente, check, target)
     /// que no tiene un "recover" posterior.
     pub fn active_alerts(&self) -> rusqlite::Result<Vec<EventRow>> {
@@ -917,6 +1521,30 @@ fn map_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventRow> {
     })
 }
 
+/// Porcentaje ok/total truncado a 2 decimales (truncado, no redondeado: un
+/// 99.996% no debe mostrarse como 100%). None sin muestras.
+fn uptime_pct(ok: i64, total: i64) -> Option<f64> {
+    if total <= 0 {
+        return None;
+    }
+    Some((ok.saturating_mul(10_000) / total) as f64 / 100.0)
+}
+
+/// Inicio de la hora (unix) que contiene `ts`.
+pub fn hour_floor(ts: i64) -> i64 {
+    ts - ts.rem_euclid(3600)
+}
+
+/// ¿Existe la columna en la tabla? (para migraciones idempotentes)
+fn has_column(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+        params![table, column],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
 fn now_unix() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -955,6 +1583,7 @@ mod tests {
             warn_count: None,
             critical_count: None,
             checks: vec![],
+            event_id: None,
         }
     }
 
@@ -1086,6 +1715,7 @@ mod tests {
             events_days: 30,
             alerts_hours: 24,
             offline_minutes: 5,
+            history_days: 400,
         };
         let now = now_unix();
 
@@ -1366,6 +1996,7 @@ mod tests {
             events_days: 0,
             alerts_hours: 24, // 24h: la incidencia de 10 días caduca
             offline_minutes: 5,
+            history_days: 400,
         };
         let purged = db.purge_expired(&retention).expect("purge");
         assert!(purged >= 1, "debe purgar el fail caducado");
