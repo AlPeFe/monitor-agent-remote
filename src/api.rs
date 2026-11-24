@@ -13,7 +13,7 @@ use tokio::sync::{Mutex, RwLock, watch};
 
 use crate::alert::AlertSettings;
 use crate::config::Settings;
-use crate::db::{AgentCheck, AgentRow, Database, EventRow, IngestPayload, Retention};
+use crate::db::{AgentCheck, AgentRow, AgentUptime, Database, EventRow, IngestPayload, Retention};
 
 const INDEX_HTML: &str = include_str!("../web/index.html");
 
@@ -96,6 +96,7 @@ pub fn router(
         .route("/api/agents", get(agents_handler))
         .route("/api/agents/{agent_id}/events", get(agent_events_handler))
         .route("/api/agents/{agent_id}/checks", get(agent_checks_handler))
+        .route("/api/agents/{agent_id}/uptime", get(agent_uptime_handler))
         .route("/api/alerts", get(alerts_handler))
         .merge(settings_router)
         .with_state(state)
@@ -314,6 +315,27 @@ async fn agent_checks_handler(
         crate::log_error!("agent checks failed: {e}");
         StatusCode::INTERNAL_SERVER_ERROR
     })
+}
+
+/// GET /api/agents/{id}/uptime — uptime por check (24h/7d/30d/365d), barra
+/// de las últimas 48 horas e incidencias fail -> recover.
+async fn agent_uptime_handler(
+    State(state): State<ApiState>,
+    Path(agent_id): Path<String>,
+) -> Result<Json<AgentUptime>, StatusCode> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or_default();
+    let db = state.db.lock().await;
+    match db.agent_uptime(&agent_id, now) {
+        Ok(Some(u)) => Ok(Json(u)),
+        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(e) => {
+            crate::log_error!("agent uptime failed: {e}");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
 }
 
 /// GET /api/alerts — avisos activos globales (fail sin recover posterior).

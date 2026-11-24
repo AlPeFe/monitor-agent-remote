@@ -182,6 +182,73 @@ pub struct AgentCheck {
     pub ts: i64,
 }
 
+/// Uptime de un check en un rango (24h, 7d...): ok/total sobre los cubos
+/// horarios. `pct` es None si no hay ninguna muestra en el rango.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct UptimeRange {
+    pub pct: Option<f64>,
+    pub total: i64,
+    pub ok: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct UptimeRanges {
+    #[serde(rename = "24h")]
+    pub h24: UptimeRange,
+    #[serde(rename = "7d")]
+    pub d7: UptimeRange,
+    #[serde(rename = "30d")]
+    pub d30: UptimeRange,
+    #[serde(rename = "365d")]
+    pub d365: UptimeRange,
+}
+
+/// Un cubo de una hora para la barra de estado (total = 0: sin muestras).
+#[derive(Debug, Clone, Serialize)]
+pub struct HourBucket {
+    pub hour_ts: i64,
+    pub total: i64,
+    pub ok: i64,
+    pub worst: Option<String>,
+}
+
+/// Incidencia fail -> recover de un check (end = None: sigue abierta).
+#[derive(Debug, Clone, Serialize)]
+pub struct Incident {
+    pub start: i64,
+    pub end: Option<i64>,
+    pub duration_seconds: i64,
+    /// Peor estado visto durante la incidencia.
+    pub status: String,
+    /// Mensaje del primer fail.
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CheckUptime {
+    pub check_type: String,
+    pub target: String,
+    pub uptime: UptimeRanges,
+    /// Últimas 48 horas, de la más antigua a la actual.
+    pub hours: Vec<HourBucket>,
+    /// Últimas 50 incidencias, la más reciente primero.
+    pub incidents: Vec<Incident>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentUptime {
+    pub agent_id: String,
+    pub now: i64,
+    /// Inicio de la hora actual (último cubo de `hours`).
+    pub hour_ts: i64,
+    pub checks: Vec<CheckUptime>,
+}
+
+/// Horas de la barra de estado.
+pub const UPTIME_BAR_HOURS: i64 = 48;
+/// Incidencias devueltas por check.
+pub const UPTIME_MAX_INCIDENTS: usize = 50;
+
 /// Política de retención de datos de la central. Se persiste en `settings`
 /// y se aplica de forma periódica por el worker de purga.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -1111,6 +1178,213 @@ impl Database {
         Ok(rows)
     }
 
+    /// Uptime por check de un agente: porcentajes 24h/7d/30d/365d, barra de
+    /// las últimas 48 horas e incidencias fail -> recover. None si el agente
+    /// no existe.
+    pub fn agent_uptime(&self, agent_id: &str, now: i64) -> rusqlite::Result<Option<AgentUptime>> {
+        let exists: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT first_seen FROM agents WHERE agent_id = ?1",
+                params![agent_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if exists.is_none() {
+            return Ok(None);
+        }
+
+        let cur = hour_floor(now);
+        // Inicio de cada rango: N cubos contando la hora actual (parcial).
+        let start = |hours: i64| cur - (hours - 1) * 3600;
+        let (s24, s7, s30, s365) = (start(24), start(24 * 7), start(24 * 30), start(24 * 365));
+        let bar_start = start(UPTIME_BAR_HOURS);
+
+        type Key = (String, String);
+        let mut checks: std::collections::BTreeMap<Key, CheckUptime> = Default::default();
+        let entry = |checks: &mut std::collections::BTreeMap<Key, CheckUptime>,
+                     check_type: String,
+                     target: String| {
+            checks
+                .entry((check_type.clone(), target.clone()))
+                .or_insert_with(|| CheckUptime {
+                    check_type,
+                    target,
+                    uptime: UptimeRanges::default(),
+                    hours: (0..UPTIME_BAR_HOURS)
+                        .map(|i| HourBucket {
+                            hour_ts: bar_start + i * 3600,
+                            total: 0,
+                            ok: 0,
+                            worst: None,
+                        })
+                        .collect(),
+                    incidents: Vec::new(),
+                });
+        };
+
+        // Checks actuales (aunque aún no tengan historial).
+        {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT check_type, target FROM agent_checks WHERE agent_id = ?1")?;
+            let rows = stmt.query_map(params![agent_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (ct, t) = row?;
+                entry(&mut checks, ct, t);
+            }
+        }
+
+        // Porcentajes: sumas por rango en una sola pasada.
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT check_type, target,
+                        SUM(CASE WHEN hour_ts >= ?2 THEN total ELSE 0 END),
+                        SUM(CASE WHEN hour_ts >= ?2 THEN ok    ELSE 0 END),
+                        SUM(CASE WHEN hour_ts >= ?3 THEN total ELSE 0 END),
+                        SUM(CASE WHEN hour_ts >= ?3 THEN ok    ELSE 0 END),
+                        SUM(CASE WHEN hour_ts >= ?4 THEN total ELSE 0 END),
+                        SUM(CASE WHEN hour_ts >= ?4 THEN ok    ELSE 0 END),
+                        SUM(total), SUM(ok)
+                 FROM check_hourly
+                 WHERE agent_id = ?1 AND hour_ts >= ?5 AND hour_ts <= ?6
+                 GROUP BY check_type, target",
+            )?;
+            let rows = stmt.query_map(params![agent_id, s24, s7, s30, s365, cur], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    [
+                        (r.get::<_, i64>(2)?, r.get::<_, i64>(3)?),
+                        (r.get::<_, i64>(4)?, r.get::<_, i64>(5)?),
+                        (r.get::<_, i64>(6)?, r.get::<_, i64>(7)?),
+                        (r.get::<_, i64>(8)?, r.get::<_, i64>(9)?),
+                    ],
+                ))
+            })?;
+            for row in rows {
+                let (ct, t, sums) = row?;
+                entry(&mut checks, ct.clone(), t.clone());
+                let c = checks.get_mut(&(ct, t)).expect("entrada recién creada");
+                let r = |(total, ok): (i64, i64)| UptimeRange {
+                    pct: uptime_pct(ok, total),
+                    total,
+                    ok,
+                };
+                c.uptime = UptimeRanges {
+                    h24: r(sums[0]),
+                    d7: r(sums[1]),
+                    d30: r(sums[2]),
+                    d365: r(sums[3]),
+                };
+            }
+        }
+
+        // Barra: últimas 48 horas.
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT check_type, target, hour_ts, total, ok, worst
+                 FROM check_hourly
+                 WHERE agent_id = ?1 AND hour_ts >= ?2 AND hour_ts <= ?3",
+            )?;
+            let rows = stmt.query_map(params![agent_id, bar_start, cur], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, String>(5)?,
+                ))
+            })?;
+            for row in rows {
+                let (ct, t, hour_ts, total, ok, worst) = row?;
+                let Some(c) = checks.get_mut(&(ct, t)) else {
+                    continue;
+                };
+                let idx = ((hour_ts - bar_start) / 3600) as usize;
+                if let Some(b) = c.hours.get_mut(idx) {
+                    b.total = total;
+                    b.ok = ok;
+                    b.worst = Some(worst);
+                }
+            }
+        }
+
+        // Incidencias: emparejar fail -> recover por check, en orden de la
+        // hora real del evento. Varios fails seguidos (p.ej. warn -> critical)
+        // son la misma incidencia.
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT check_type, target, event, status, message, ts
+                 FROM events
+                 WHERE agent_id = ?1 AND event IN ('fail', 'recover')
+                 ORDER BY ts ASC, id ASC",
+            )?;
+            let rows = stmt.query_map(params![agent_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, i64>(5)?,
+                ))
+            })?;
+            let mut open: std::collections::HashMap<Key, Incident> = Default::default();
+            for row in rows {
+                let (ct, t, event, status, message, ts) = row?;
+                let key = (ct, t);
+                if event == "fail" {
+                    match open.get_mut(&key) {
+                        Some(inc) => {
+                            if severity(&status) > severity(&inc.status) {
+                                inc.status = status;
+                            }
+                        }
+                        None => {
+                            open.insert(
+                                key,
+                                Incident {
+                                    start: ts,
+                                    end: None,
+                                    duration_seconds: 0,
+                                    status,
+                                    message,
+                                },
+                            );
+                        }
+                    }
+                } else if let Some(mut inc) = open.remove(&key) {
+                    inc.end = Some(ts);
+                    inc.duration_seconds = (ts - inc.start).max(0);
+                    if let Some(c) = checks.get_mut(&key) {
+                        c.incidents.push(inc);
+                    }
+                }
+            }
+            for (key, mut inc) in open {
+                inc.duration_seconds = (now - inc.start).max(0);
+                if let Some(c) = checks.get_mut(&key) {
+                    c.incidents.push(inc);
+                }
+            }
+            for c in checks.values_mut() {
+                c.incidents.sort_by(|a, b| b.start.cmp(&a.start));
+                c.incidents.truncate(UPTIME_MAX_INCIDENTS);
+            }
+        }
+
+        Ok(Some(AgentUptime {
+            agent_id: agent_id.to_string(),
+            now,
+            hour_ts: cur,
+            checks: checks.into_values().collect(),
+        }))
+    }
+
     /// Avisos activos globales: último "fail" de cada (agente, check, target)
     /// que no tiene un "recover" posterior.
     pub fn active_alerts(&self) -> rusqlite::Result<Vec<EventRow>> {
@@ -1154,6 +1428,15 @@ fn map_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventRow> {
         ts: row.get(8)?,
         received_at: row.get(9)?,
     })
+}
+
+/// Porcentaje ok/total truncado a 2 decimales (truncado, no redondeado: un
+/// 99.996% no debe mostrarse como 100%). None sin muestras.
+fn uptime_pct(ok: i64, total: i64) -> Option<f64> {
+    if total <= 0 {
+        return None;
+    }
+    Some((ok.saturating_mul(10_000) / total) as f64 / 100.0)
 }
 
 /// Inicio de la hora (unix) que contiene `ts`.

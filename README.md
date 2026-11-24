@@ -126,6 +126,7 @@ Respuesta: `200 {"ok": true, "stored": 120, "duplicates": 3}`.
 | POST   | `/api/alert/test`             | Envía un correo de prueba con la config SMTP dada (exige token si lo hay). |
 | GET    | `/api/agents`                 | Estado agregado de todos los servidores. Un agente sin heartbeat dentro de `retention.offline_minutes` aparece con `status: "offline"`. |
 | GET    | `/api/agents/{id}/events`     | Historial de eventos de un servidor.     |
+| GET    | `/api/agents/{id}/uptime`     | Uptime por check. Ver abajo.             |
 | GET    | `/api/alerts`                 | Avisos activos (fail sin recover).       |
 | GET    | `/api/settings`               | Config actual (listen, token, db_path, ingest_url). Con token definido exige `Authorization: Bearer`. |
 | PUT    | `/api/settings`               | Guarda `listen` y `token` (aplica en vivo). |
@@ -135,6 +136,26 @@ Si defines `token` en la configuracion, `/api/ingest` **y** `/api/settings`
 panel (estado, agentes, alertas) sigue siendo de solo lectura y sin
 autenticación para la LAN. El navegador guarda el token de acceso en su
 `localStorage` (campo *access token* del panel de ajustes).
+
+### Uptime
+
+La central guarda, por cada check del inventario del heartbeat, cuántas
+muestras llegaron en cada hora y cuántas estaban en `ok` (hora del
+`timestamp` del heartbeat). Se conservan `retention.history_days` días.
+
+`GET /api/agents/{id}/uptime` devuelve `404` si el agente no existe y, si no,
+`{agent_id, now, hour_ts, checks: [...]}`. Cada check trae:
+
+- `uptime`: objetos `24h`, `7d`, `30d` y `365d` con `pct` (ok/total en %,
+  truncado a 2 decimales; `null` si no hay muestras), `total` y `ok`. Cada
+  rango cuenta la hora actual, aunque esté a medias.
+- `hours`: las últimas 48 horas, de la más antigua a la actual, con
+  `hour_ts`, `total`, `ok` y `worst` (peor estado de la hora, `null` sin
+  muestras).
+- `incidents`: hasta 50 pares fail → recover sacados de `events`, la más
+  reciente primero, con `start`, `end` (`null` si sigue abierta),
+  `duration_seconds` (hasta ahora si sigue abierta), `status` y `message`.
+  Solo cubren lo que queda en `events` (`retention.events_days`).
 
 ## Log
 

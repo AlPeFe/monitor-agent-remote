@@ -277,6 +277,38 @@ b.ev { font-weight: 800; }
 b.ev.ok { color: var(--ok-text); }
 b.ev.warn { color: var(--warn-text); }
 b.ev.crit { color: var(--crit-text); }
+
+/* ---------- uptime por check (barra 48h + porcentajes + incidencias) ---------- */
+tbody tr.has-uptime td { border-bottom: none; padding-bottom: 2px; }
+tbody tr.uptime-row:hover { background: transparent; }
+tr.uptime-row td { padding-top: 0; font-family: var(--ui); }
+.uptime-line { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; }
+.ubar-wrap { flex: 1 1 260px; min-width: 200px; }
+.ubar { display: flex; gap: 2px; height: 20px; }
+.ubar i { flex: 1; min-width: 2px; border-radius: 3px; background: var(--offline-tint); }
+.ubar i.ok { background: var(--ok); }
+.ubar i.partial { background: var(--warn); }
+.ubar i.down { background: var(--crit); }
+.ubar i.nodata { background: var(--offline-tint); }
+.ubar-axis { display: flex; justify-content: space-between; font-size: 10px; color: var(--muted-deco); margin-top: 2px; font-family: var(--mono); }
+.upct { display: flex; flex-wrap: wrap; gap: 6px; }
+.upct span {
+  display: inline-flex; align-items: baseline; gap: 5px;
+  background: var(--bg-soft); border: 1px solid var(--border);
+  border-radius: 999px; padding: 2px 10px;
+  font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+.upct .lbl { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+.upct b { font-family: var(--mono); font-size: 12px; font-weight: 700; color: var(--text); }
+.upct b.ok { color: var(--ok-text); }
+.upct b.warn { color: var(--warn-text); }
+.upct b.crit { color: var(--crit-text); }
+.upct .nd { font-size: 11px; color: var(--muted); }
+.incidents { list-style: none; margin: 6px 0 4px; padding: 0; font-size: 12px; color: var(--muted); }
+.incidents li { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; padding: 2px 0; }
+.incidents li b { font-family: var(--mono); font-weight: 700; color: var(--text); }
+.incidents li .open { color: var(--crit-text); font-weight: 700; }
+.incidents li .msg { word-break: break-all; }
 </style>
 </head>
 <body>
@@ -545,13 +577,20 @@ b.ev.crit { color: var(--crit-text); }
     const panel = document.getElementById('agent-panel');
     panel.innerHTML = '<div class="group"><h2><span>…</span></h2></div>';
     try {
-      const [checksRes, eventsRes] = await Promise.all([
+      const [checksRes, eventsRes, uptimeRes] = await Promise.all([
         fetch('/api/agents/' + encodeURIComponent(agentId) + '/checks', { cache: 'no-store' }),
-        fetch('/api/agents/' + encodeURIComponent(agentId) + '/events?limit=25', { cache: 'no-store' })
+        fetch('/api/agents/' + encodeURIComponent(agentId) + '/events?limit=25', { cache: 'no-store' }),
+        fetch('/api/agents/' + encodeURIComponent(agentId) + '/uptime', { cache: 'no-store' })
       ]);
       if (!checksRes.ok || !eventsRes.ok) throw new Error('status ' + checksRes.status);
       const checks = await checksRes.json();
       const events = await eventsRes.json();
+      // El uptime es un extra: si falla, el panel se pinta igual sin él.
+      const uptimeByCheck = {};
+      if (uptimeRes.ok) {
+        const up = await uptimeRes.json();
+        (up.checks || []).forEach(function (u) { uptimeByCheck[checkKey(u)] = u; });
+      }
       const group = document.createElement('div');
       group.className = 'group';
       const h = document.createElement('h2');
@@ -586,6 +625,11 @@ b.ev.crit { color: var(--crit-text); }
             '<td class="message">' + escapeHtml(c.message) + '</td>' +
             '<td class="age">' + timeAgo(c.ts) + '</td>';
           tbody.appendChild(tr);
+          const u = uptimeByCheck[checkKey(c)];
+          if (u) {
+            tr.className = 'has-uptime';
+            tbody.appendChild(renderUptimeRow(u, 5));
+          }
         });
         table.appendChild(tbody);
         body.appendChild(table);
@@ -630,6 +674,106 @@ b.ev.crit { color: var(--crit-text); }
       panel.innerHTML = '<div class="group"><h2><span>Detalle · ' + escapeHtml(agentId) + '</span></h2><div class="empty">failed: ' + escapeHtml(String(err)) + '</div></div>';
       currentAgent = null;
     }
+  }
+
+  // ---------- uptime por check ----------
+  // Todo lo que viene del servidor se pinta con textContent/title.
+  var INCIDENTS_SHOWN = 5;
+
+  function checkKey(c) { return c.check_type + '\u0000' + c.target; }
+
+  function el(tag, cls, text) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text != null) e.textContent = text;
+    return e;
+  }
+
+  function fmtDuration(s) {
+    s = Math.max(0, Math.floor(s));
+    if (s < 60) return s + 's';
+    if (s < 3600) return Math.floor(s / 60) + 'm ' + (s % 60) + 's';
+    if (s < 86400) return Math.floor(s / 3600) + 'h ' + Math.floor((s % 3600) / 60) + 'm';
+    return Math.floor(s / 86400) + 'd ' + Math.floor((s % 86400) / 3600) + 'h';
+  }
+
+  function fmtDate(unix) {
+    return new Date(unix * 1000).toLocaleString();
+  }
+
+  // Color del cubo: verde todo ok, rojo ninguna muestra ok, ámbar mezcla,
+  // gris sin muestras.
+  function bucketClass(b) {
+    if (!b.total) return 'nodata';
+    if (b.ok === b.total) return 'ok';
+    if (b.ok === 0) return 'down';
+    return 'partial';
+  }
+
+  function pctClass(p) {
+    if (p == null) return '';
+    if (p >= 99.9) return 'ok';
+    if (p >= 99) return 'warn';
+    return 'crit';
+  }
+
+  function renderUptimeRow(u, colspan) {
+    var tr = el('tr', 'uptime-row');
+    var td = el('td');
+    td.colSpan = colspan;
+
+    var line = el('div', 'uptime-line');
+    var barWrap = el('div', 'ubar-wrap');
+    var bar = el('div', 'ubar');
+    (u.hours || []).forEach(function (b) {
+      var cell = el('i', bucketClass(b));
+      var desde = new Date(b.hour_ts * 1000);
+      var txt = desde.toLocaleDateString() + ' ' + desde.getHours() + ':00 · ';
+      txt += b.total ? (b.ok + '/' + b.total + ' ok' + (b.worst && b.worst !== 'ok' ? ' · peor: ' + b.worst : '')) : 'sin datos';
+      cell.title = txt;
+      bar.appendChild(cell);
+    });
+    barWrap.appendChild(bar);
+    var axis = el('div', 'ubar-axis');
+    axis.appendChild(el('span', null, '48h'));
+    axis.appendChild(el('span', null, 'ahora'));
+    barWrap.appendChild(axis);
+    line.appendChild(barWrap);
+
+    var pcts = el('div', 'upct');
+    [['24h', '24h'], ['7d', '7d'], ['30d', '30d'], ['365d', '1a']].forEach(function (r) {
+      var range = (u.uptime || {})[r[0]] || {};
+      var pill = el('span');
+      pill.appendChild(el('span', 'lbl', r[1]));
+      pill.appendChild(el('b', pctClass(range.pct), range.pct == null ? '—' : range.pct.toFixed(2) + '%'));
+      pill.title = range.total ? (range.ok + '/' + range.total + ' muestras ok') : 'sin muestras';
+      pcts.appendChild(pill);
+    });
+    line.appendChild(pcts);
+    td.appendChild(line);
+
+    var incidents = u.incidents || [];
+    if (incidents.length) {
+      var ul = el('ul', 'incidents');
+      incidents.slice(0, INCIDENTS_SHOWN).forEach(function (inc) {
+        var li = el('li');
+        var g = el('span', 'glyph ' + (inc.end == null ? (inc.status === 'critical' ? 'critical' : 'warn') : 'ok'));
+        li.appendChild(g);
+        li.appendChild(el('span', null, fmtDate(inc.start) + ' → '));
+        if (inc.end == null) li.appendChild(el('span', 'open', 'abierta'));
+        else li.appendChild(el('span', null, fmtDate(inc.end)));
+        li.appendChild(el('b', null, fmtDuration(inc.duration_seconds)));
+        if (inc.message) li.appendChild(el('span', 'msg', inc.message));
+        ul.appendChild(li);
+      });
+      if (incidents.length > INCIDENTS_SHOWN) {
+        ul.appendChild(el('li', null, '… y ' + (incidents.length - INCIDENTS_SHOWN) + ' incidencias más'));
+      }
+      td.appendChild(ul);
+    }
+
+    tr.appendChild(td);
+    return tr;
   }
 
   function closeAgentPanel() {
