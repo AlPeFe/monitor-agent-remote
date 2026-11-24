@@ -198,6 +198,14 @@ pub struct Retention {
     /// panel (por ejemplo 5 minutos con el heartbeat a 60 s). 0 = nunca.
     #[serde(default)]
     pub offline_minutes: i64,
+    /// Días de historial de uptime por hora (check_hourly / agent_hourly).
+    /// 0 = conservar indefinidamente. Si no viene (UI antigua), 400.
+    #[serde(default = "default_history_days")]
+    pub history_days: i64,
+}
+
+fn default_history_days() -> i64 {
+    400
 }
 
 impl Default for Retention {
@@ -206,6 +214,7 @@ impl Default for Retention {
             events_days: 30,
             alerts_hours: 24 * 7, // 7 días de incidencias sin recuperar
             offline_minutes: 5,
+            history_days: default_history_days(),
         }
     }
 }
@@ -266,7 +275,8 @@ impl Database {
                retention_events_days    INTEGER NOT NULL DEFAULT 30,
                retention_alerts_hours   INTEGER NOT NULL DEFAULT 168,
                retention_offline_minutes INTEGER NOT NULL DEFAULT 5,
-               alert_json TEXT NOT NULL DEFAULT ''
+               alert_json TEXT NOT NULL DEFAULT '',
+               retention_history_days INTEGER NOT NULL DEFAULT 400
              );
 
              -- Estado del aviso de servidor-sin-senales: que servidores estan
@@ -285,6 +295,29 @@ impl Database {
                event_id TEXT NOT NULL,
                ts       INTEGER NOT NULL,
                PRIMARY KEY (agent_id, event_id)
+             ) WITHOUT ROWID;
+
+             -- Historial de estado por check en cubos de una hora (uptime).
+             -- Cada heartbeat suma 1 a total (y a ok si el check estaba ok)
+             -- en el cubo de SU timestamp. worst = peor estado visto.
+             CREATE TABLE IF NOT EXISTS check_hourly (
+               agent_id   TEXT NOT NULL,
+               check_type TEXT NOT NULL,
+               target     TEXT NOT NULL,
+               hour_ts    INTEGER NOT NULL,
+               total      INTEGER NOT NULL DEFAULT 0,
+               ok         INTEGER NOT NULL DEFAULT 0,
+               worst      TEXT NOT NULL DEFAULT 'ok',
+               PRIMARY KEY (agent_id, check_type, target, hour_ts)
+             ) WITHOUT ROWID;
+
+             -- Heartbeats recibidos por agente y hora: una hora sin fila es
+             -- una hora sin datos (servidor caido o sin red).
+             CREATE TABLE IF NOT EXISTS agent_hourly (
+               agent_id   TEXT NOT NULL,
+               hour_ts    INTEGER NOT NULL,
+               heartbeats INTEGER NOT NULL DEFAULT 0,
+               PRIMARY KEY (agent_id, hour_ts)
              ) WITHOUT ROWID;",
         )?;
 
@@ -329,6 +362,12 @@ impl Database {
                 [],
             )?;
         }
+        if !has_column(&conn, "settings", "retention_history_days")? {
+            conn.execute(
+                "ALTER TABLE settings ADD COLUMN retention_history_days INTEGER NOT NULL DEFAULT 400",
+                [],
+            )?;
+        }
         // El índice va después de la migración: necesita la columna.
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_events_event_id
@@ -366,7 +405,8 @@ impl Database {
     pub fn get_retention(&self) -> Retention {
         self.conn
             .query_row(
-                "SELECT retention_events_days, retention_alerts_hours, retention_offline_minutes
+                "SELECT retention_events_days, retention_alerts_hours, retention_offline_minutes,
+                        retention_history_days
                  FROM settings WHERE key = 'default'",
                 [],
                 |r| {
@@ -374,6 +414,7 @@ impl Database {
                         events_days: r.get(0)?,
                         alerts_hours: r.get(1)?,
                         offline_minutes: r.get(2)?,
+                        history_days: r.get(3)?,
                     })
                 },
             )
@@ -469,16 +510,18 @@ impl Database {
     /// Guarda la política de retención (UPSERT sobre la fila 'default').
     pub fn set_retention(&mut self, retention: &Retention) -> rusqlite::Result<()> {
         self.conn.execute(
-            "INSERT INTO settings (key, listen, token, retention_events_days, retention_alerts_hours, retention_offline_minutes)
-             VALUES ('default', '', NULL, ?1, ?2, ?3)
+            "INSERT INTO settings (key, listen, token, retention_events_days, retention_alerts_hours, retention_offline_minutes, retention_history_days)
+             VALUES ('default', '', NULL, ?1, ?2, ?3, ?4)
              ON CONFLICT(key) DO UPDATE SET
                retention_events_days       = excluded.retention_events_days,
                retention_alerts_hours      = excluded.retention_alerts_hours,
-               retention_offline_minutes   = excluded.retention_offline_minutes",
+               retention_offline_minutes   = excluded.retention_offline_minutes,
+               retention_history_days      = excluded.retention_history_days",
             params![
                 retention.events_days,
                 retention.alerts_hours,
-                retention.offline_minutes
+                retention.offline_minutes,
+                retention.history_days
             ],
         )?;
         Ok(())
@@ -588,7 +631,20 @@ impl Database {
             params![check_cutoff],
         )?;
 
-        // 4) Ids de heartbeats ya vistos: basta con una semana (margen de
+        // 4) Historial de uptime por hora.
+        if retention.history_days > 0 {
+            let cutoff = now - retention.history_days * 86_400;
+            deleted += self.conn.execute(
+                "DELETE FROM check_hourly WHERE hour_ts < ?1",
+                params![cutoff],
+            )?;
+            deleted += self.conn.execute(
+                "DELETE FROM agent_hourly WHERE hour_ts < ?1",
+                params![cutoff],
+            )?;
+        }
+
+        // 5) Ids de heartbeats ya vistos: basta con una semana (margen de
         //    sobra para que un agente vacíe su backlog).
         deleted += self.conn.execute(
             "DELETE FROM seen_events WHERE ts < ?1",
@@ -715,6 +771,9 @@ impl Database {
 
         match p.event.as_str() {
             "heartbeat" => {
+                // Historial de uptime: cuenta en el cubo de la hora real del
+                // heartbeat, también si es un reenvío atrasado.
+                self.record_history(&p.agent_id, ts, &p.checks)?;
                 // Un heartbeat reenviado (backlog) más viejo que el último
                 // aplicado no puede pisar el estado actual con datos antiguos.
                 let last_hb_ts: i64 = self.conn.query_row(
@@ -861,6 +920,43 @@ impl Database {
             )
             .optional()
             .map(|v| v.unwrap_or(0))
+    }
+
+    /// Suma el heartbeat a los cubos horarios del agente y de cada check del
+    /// inventario (hora = timestamp del heartbeat redondeado a la hora).
+    fn record_history(
+        &mut self,
+        agent_id: &str,
+        ts: i64,
+        checks: &[CheckSnapshot],
+    ) -> rusqlite::Result<()> {
+        let hour = hour_floor(ts);
+        self.conn.execute(
+            "INSERT INTO agent_hourly (agent_id, hour_ts, heartbeats) VALUES (?1, ?2, 1)
+             ON CONFLICT(agent_id, hour_ts) DO UPDATE SET heartbeats = heartbeats + 1",
+            params![agent_id, hour],
+        )?;
+        let mut stmt = self.conn.prepare_cached(
+            "INSERT INTO check_hourly (agent_id, check_type, target, hour_ts, total, ok, worst)
+             VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6)
+             ON CONFLICT(agent_id, check_type, target, hour_ts) DO UPDATE SET
+               total = total + 1,
+               ok    = ok + excluded.ok,
+               worst = CASE
+                 WHEN (CASE excluded.worst WHEN 'critical' THEN 3 WHEN 'ok' THEN 1 ELSE 2 END)
+                    > (CASE check_hourly.worst WHEN 'critical' THEN 3 WHEN 'ok' THEN 1 ELSE 2 END)
+                 THEN excluded.worst ELSE check_hourly.worst END",
+        )?;
+        for c in checks {
+            let status = if c.status.trim().is_empty() {
+                "unknown"
+            } else {
+                c.status.trim()
+            };
+            let ok = i64::from(status == "ok");
+            stmt.execute(params![agent_id, c.check_type, c.target, hour, ok, status])?;
+        }
+        Ok(())
     }
 
     /// Aplica el inventario de checks del heartbeat sobre `agent_checks`.
@@ -1060,6 +1156,11 @@ fn map_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventRow> {
     })
 }
 
+/// Inicio de la hora (unix) que contiene `ts`.
+pub fn hour_floor(ts: i64) -> i64 {
+    ts - ts.rem_euclid(3600)
+}
+
 /// ¿Existe la columna en la tabla? (para migraciones idempotentes)
 fn has_column(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
     let n: i64 = conn.query_row(
@@ -1240,6 +1341,7 @@ mod tests {
             events_days: 30,
             alerts_hours: 24,
             offline_minutes: 5,
+            history_days: 400,
         };
         let now = now_unix();
 
@@ -1520,6 +1622,7 @@ mod tests {
             events_days: 0,
             alerts_hours: 24, // 24h: la incidencia de 10 días caduca
             offline_minutes: 5,
+            history_days: 400,
         };
         let purged = db.purge_expired(&retention).expect("purge");
         assert!(purged >= 1, "debe purgar el fail caducado");

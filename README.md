@@ -61,7 +61,7 @@ Campos gestionables desde la web:
 | `token`       | Opcional. Si se define, `/api/ingest` exige `Authorization: Bearer <token>`.|
 | `db_path`     | Solo lectura (elegida antes del primer arranque).                           |
 | `ingest_url`  | URL que deben apuntar los `[exporter]` de los agentes.                      |
-| `retention`   | Retención de datos: días de eventos, horas de incidencias activas y minutos para marcar un servidor offline. La purga se aplica cada hora; el estado offline, en vivo (0 = indefinido). |
+| `retention`   | Retención de datos: días de eventos (`events_days`), horas de incidencias activas (`alerts_hours`), minutos para marcar un servidor offline (`offline_minutes`) y días de historial de uptime por hora (`history_days`, 400 por defecto). La purga se aplica cada hora; el estado offline, en vivo (0 = indefinido). |
 | `alert`       | Alertas por correo de la central: avisa cuando un servidor deja de enviar señales (y cuando vuelve). Incluye `enabled`, `to[]`, `cooldown_minutes` (0 = sólo el primer correo), `recovery_notifications` y el bloque `smtp` (host, port, tls, username, password, from). Con `username` vacío no se envía AUTH. El botón "enviar correo de prueba" del panel valida la configuración. |
 
 ## Contrato del webhook

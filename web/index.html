@@ -359,6 +359,11 @@ b.ev.crit { color: var(--crit-text); }
           <input id="cfg-ret-offline" type="number" min="0" placeholder="5">
           <p class="hint">Sin heartbeat en este tiempo, el servidor se marca offline.</p>
         </div>
+        <div class="field">
+          <label>Historial de uptime (días)</label>
+          <input id="cfg-ret-history" type="number" min="0" placeholder="400">
+          <p class="hint">Estado por hora de cada check (porcentajes y barra).</p>
+        </div>
       </div>
 
       <h3 class="section-title">Alertas por correo (servidor caído)</h3>
@@ -710,6 +715,7 @@ b.ev.crit { color: var(--crit-text); }
       document.getElementById('cfg-ret-events').value = r.events_days != null ? r.events_days : 30;
       document.getElementById('cfg-ret-alerts').value = r.alerts_hours != null ? r.alerts_hours : 168;
       document.getElementById('cfg-ret-offline').value = r.offline_minutes != null ? r.offline_minutes : 5;
+      document.getElementById('cfg-ret-history').value = r.history_days != null ? r.history_days : 400;
       var al = s.alert || {};
       var smtp = al.smtp || {};
       document.getElementById('cfg-al-enabled').checked = !!al.enabled;
@@ -731,6 +737,7 @@ b.ev.crit { color: var(--crit-text); }
       events_days: parseInt(document.getElementById('cfg-ret-events').value, 10) || 0,
       alerts_hours: parseInt(document.getElementById('cfg-ret-alerts').value, 10) || 0,
       offline_minutes: parseInt(document.getElementById('cfg-ret-offline').value, 10) || 0,
+      history_days: parseInt(document.getElementById('cfg-ret-history').value, 10) || 0,
     };
     var btn = document.getElementById('cfg-save');
     btn.disabled = true; btn.textContent = 'saving…';
