@@ -1,0 +1,80 @@
+# Release automatico de monitor-agent-remote al subir un tag vX.Y.Z.
+#
+# Compila en Windows, empaqueta monitor-agent-remote-vX.Y.Z-windows-x64.zip con el
+# mismo contenido que los releases hechos a mano (exe, install.ps1,
+# uninstall.ps1, config.example.toml y README.md, todo en la raiz del zip),
+# calcula su .sha256 y lo sube al release del tag. Si el release ya existe
+# (creado a mano con sus notas), solo sube o reemplaza los dos ficheros.
+#
+#   git tag v0.2.6 && git push origin v0.2.6
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      APP: monitor-agent-remote
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust estable
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
+          cargo --version
+
+      - name: El tag coincide con la version de Cargo.toml
+        run: |
+          $m = Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
+          $version = $m.Matches[0].Groups[1].Value
+          if ("v$version" -ne $env:TAG) {
+            Write-Error "El tag $env:TAG no coincide con la version de Cargo.toml ($version)."
+            exit 1
+          }
+
+      - name: Compilar
+        run: cargo build --release --locked
+
+      - name: Empaquetar
+        run: |
+          $name = "$env:APP-$env:TAG-windows-x64"
+          $stage = Join-Path $env:RUNNER_TEMP $name
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item -Destination $stage -Path @(
+            "target/release/$env:APP.exe",
+            "scripts/install.ps1",
+            "scripts/uninstall.ps1",
+            "config.example.toml",
+            "README.md"
+          )
+          Compress-Archive -Path "$stage/*" -DestinationPath "$name.zip" -Force
+          $hash = (Get-FileHash -Algorithm SHA256 -Path "$name.zip").Hash.ToLower()
+          # Formato de sha256sum: "<hash>  <fichero>"
+          [IO.File]::WriteAllText((Join-Path $PWD "$name.zip.sha256"), "$hash  $name.zip`n")
+          Get-Content "$name.zip.sha256"
+          "ZIP=$name.zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Publicar en GitHub Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view $env:TAG *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $env:TAG $env:ZIP "$env:ZIP.sha256" --clobber
+          } else {
+            gh release create $env:TAG $env:ZIP "$env:ZIP.sha256" --verify-tag --title "$env:APP $env:TAG" --generate-notes
+          }
