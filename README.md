@@ -78,7 +78,8 @@ Cada **monitor-agent** hace `POST /api/ingest` con `Content-Type: application/js
 | `status`         | string          | `ok`, `warn`, `critical` o `unknown`.                            |
 | `message`        | string          | Mensaje legible de la comprobacion.                              |
 | `value`          | number?         | Valor numerico opcional.                                         |
-| `timestamp`      | number          | Unix seconds del evento.                                         |
+| `timestamp`      | number          | Unix seconds del evento (hora real del agente). Es la que usa el historial; `last_seen` es la hora de llegada. |
+| `event_id`       | string?         | Id único del evento generado por el agente. Si la central ya recibió ese `(agent_id, event_id)`, responde `200` con `"duplicate": true` y no procesa nada. Sin él, todo funciona como antes. |
 | `ok_count`       | number?         | Solo heartbeat: comprobaciones OK.                               |
 | `warn_count`     | number?         | Solo heartbeat: comprobaciones en Warning.                       |
 | `critical_count` | number?         | Solo heartbeat: comprobaciones en Critical.                      |
@@ -100,13 +101,28 @@ Ejemplo:
 }
 ```
 
-Respuesta: `200 {"ok": true, "stored": 42, "agent_id": "server-web-01"}`.
+Respuesta: `200 {"ok": true, "stored": 42, "agent_id": "server-web-01", "duplicate": false}`.
+
+Un heartbeat con `timestamp` anterior al último heartbeat aplicado de ese
+agente (un reenvío atrasado) no pisa el estado actual ni el inventario de
+checks: solo cuenta para el historial.
+
+### Lotes
+
+`POST /api/ingest/batch` recibe un array JSON con los mismos objetos que
+`/api/ingest` (máximo 500) y los aplica en orden en una sola transacción. Lo
+usa el agente para reenviar su backlog tras un corte. Exige el mismo token.
+Si algún elemento no trae `agent_id` o `event`, se rechaza el lote entero
+(`400`); con más de 500 elementos, `413`.
+
+Respuesta: `200 {"ok": true, "stored": 120, "duplicates": 3}`.
 
 ## API
 
 | Metodo | Ruta                          | Descripcion                              |
 |--------|-------------------------------|------------------------------------------|
 | POST   | `/api/ingest`                 | Recibe un evento de un agente.           |
+| POST   | `/api/ingest/batch`           | Recibe un lote de eventos (máx. 500) en una transacción. |
 | POST   | `/api/alert/test`             | Envía un correo de prueba con la config SMTP dada (exige token si lo hay). |
 | GET    | `/api/agents`                 | Estado agregado de todos los servidores. Un agente sin heartbeat dentro de `retention.offline_minutes` aparece con `status: "offline"`. |
 | GET    | `/api/agents/{id}/events`     | Historial de eventos de un servidor.     |

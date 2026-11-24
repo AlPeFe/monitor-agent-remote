@@ -36,6 +36,20 @@ pub struct IngestPayload {
     /// Los agentes anteriores no lo mandan (queda vacío y no se toca nada).
     #[serde(default)]
     pub checks: Vec<CheckSnapshot>,
+    /// Identificador único del evento generado por el agente (idempotencia).
+    /// Si llega dos veces el mismo (agent_id, event_id) el segundo no se
+    /// procesa. Los agentes antiguos no lo mandan: se comportan como siempre.
+    #[serde(default)]
+    pub event_id: Option<String>,
+}
+
+/// Resultado de ingerir un evento.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct IngestOutcome {
+    /// Id de la fila en `events` (0 si no se guarda como evento o es duplicado).
+    pub id: i64,
+    /// Ya se había ingerido un evento con el mismo (agent_id, event_id).
+    pub duplicate: bool,
 }
 
 /// Una comprobación dentro del inventario del heartbeat.
@@ -211,7 +225,8 @@ impl Database {
                warn_count     INTEGER NOT NULL DEFAULT 0,
                critical_count INTEGER NOT NULL DEFAULT 0,
                last_seen      INTEGER NOT NULL DEFAULT 0,
-               first_seen     INTEGER NOT NULL DEFAULT 0
+               first_seen     INTEGER NOT NULL DEFAULT 0,
+               last_hb_ts     INTEGER NOT NULL DEFAULT 0
              );
 
              CREATE TABLE IF NOT EXISTS events (
@@ -224,7 +239,8 @@ impl Database {
                message     TEXT NOT NULL DEFAULT '',
                value       REAL,
                ts          INTEGER NOT NULL,
-               received_at INTEGER NOT NULL
+               received_at INTEGER NOT NULL,
+               event_id    TEXT
              );
 
              CREATE INDEX IF NOT EXISTS idx_events_agent_id ON events(agent_id, id DESC);
@@ -260,7 +276,16 @@ impl Database {
                since        INTEGER NOT NULL,
                last_sent_at INTEGER NOT NULL DEFAULT 0,
                retry_after  INTEGER NOT NULL DEFAULT 0
-             );",
+             );
+
+             -- Idempotencia de los heartbeats (no se guardan en events): ids
+             -- ya vistos, se purgan a los 7 dias.
+             CREATE TABLE IF NOT EXISTS seen_events (
+               agent_id TEXT NOT NULL,
+               event_id TEXT NOT NULL,
+               ts       INTEGER NOT NULL,
+               PRIMARY KEY (agent_id, event_id)
+             ) WITHOUT ROWID;",
         )?;
 
         // Migración idempotente: las BDs creadas por versiones anteriores
@@ -293,6 +318,23 @@ impl Database {
                 [],
             )?;
         }
+        // Migraciones idempotentes de la ingesta idempotente: event_id en
+        // events y último heartbeat aplicado por agente.
+        if !has_column(&conn, "events", "event_id")? {
+            conn.execute("ALTER TABLE events ADD COLUMN event_id TEXT", [])?;
+        }
+        if !has_column(&conn, "agents", "last_hb_ts")? {
+            conn.execute(
+                "ALTER TABLE agents ADD COLUMN last_hb_ts INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        // El índice va después de la migración: necesita la columna.
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_events_event_id
+             ON events(agent_id, event_id) WHERE event_id IS NOT NULL",
+            [],
+        )?;
         Ok(Self { conn })
     }
 
@@ -546,27 +588,100 @@ impl Database {
             params![check_cutoff],
         )?;
 
+        // 4) Ids de heartbeats ya vistos: basta con una semana (margen de
+        //    sobra para que un agente vacíe su backlog).
+        deleted += self.conn.execute(
+            "DELETE FROM seen_events WHERE ts < ?1",
+            params![now - 7 * 86_400],
+        )?;
+
         Ok(deleted as i64)
     }
 
+    /// Ingiere un evento dentro de su propia transacción.
+    pub fn ingest(&mut self, p: &IngestPayload) -> rusqlite::Result<IngestOutcome> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        match self.ingest_inner(p) {
+            Ok(out) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(out)
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
+    /// Ingiere un lote en orden y en una sola transacción (backlog que el
+    /// agente reenvía al recuperar la conexión). Si algo falla no se aplica
+    /// nada. Devuelve (guardados, duplicados).
+    pub fn ingest_batch(&mut self, payloads: &[IngestPayload]) -> rusqlite::Result<(i64, i64)> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let mut stored = 0;
+        let mut duplicates = 0;
+        for p in payloads {
+            match self.ingest_inner(p) {
+                Ok(out) if out.duplicate => duplicates += 1,
+                Ok(_) => stored += 1,
+                Err(e) => {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    return Err(e);
+                }
+            }
+        }
+        self.conn.execute_batch("COMMIT")?;
+        Ok((stored, duplicates))
+    }
+
+    /// ¿Ya se ingirió este (agent_id, event_id)? Mira events (fail/recover)
+    /// y seen_events (heartbeats).
+    fn is_duplicate(&self, agent_id: &str, event_id: &str) -> rusqlite::Result<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT (SELECT COUNT(*) FROM events WHERE agent_id = ?1 AND event_id = ?2)
+                  + (SELECT COUNT(*) FROM seen_events WHERE agent_id = ?1 AND event_id = ?2)",
+            params![agent_id, event_id],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
     /// Inserta el evento y actualiza el estado agregado del agente.
-    pub fn ingest(&mut self, p: &IngestPayload) -> rusqlite::Result<i64> {
+    fn ingest_inner(&mut self, p: &IngestPayload) -> rusqlite::Result<IngestOutcome> {
         let now = now_unix();
+        // Hora real del evento (la del agente): es la que alimenta el
+        // historial. last_seen sigue siendo la hora de llegada.
         let ts = p.timestamp.unwrap_or(now);
         let status = if p.status.trim().is_empty() {
             "unknown"
         } else {
             p.status.trim()
         };
+        let event_id = p
+            .event_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+
+        // Idempotencia: un reenvío del mismo evento no reprocesa nada.
+        if let Some(eid) = event_id
+            && self.is_duplicate(&p.agent_id, eid)?
+        {
+            return Ok(IngestOutcome {
+                id: 0,
+                duplicate: true,
+            });
+        }
 
         // Retención: los heartbeats NO se guardan como eventos (solo actualizan
         // el estado agregado del agente). La tabla events conserva fails y
         // recovers, que es donde está la historia que importa.
         let is_heartbeat = p.event == "heartbeat";
+        let mut id = 0;
         if !is_heartbeat {
             self.conn.execute(
-                "INSERT INTO events (agent_id, event, check_type, target, status, message, value, ts, received_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                "INSERT INTO events (agent_id, event, check_type, target, status, message, value, ts, received_at, event_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     p.agent_id,
                     p.event,
@@ -576,11 +691,17 @@ impl Database {
                     p.message,
                     p.value,
                     ts,
-                    now
+                    now,
+                    event_id
                 ],
             )?;
+            id = self.conn.last_insert_rowid();
+        } else if let Some(eid) = event_id {
+            self.conn.execute(
+                "INSERT OR IGNORE INTO seen_events (agent_id, event_id, ts) VALUES (?1, ?2, ?3)",
+                params![p.agent_id, eid, now],
+            )?;
         }
-        let id = self.conn.last_insert_rowid();
 
         let host = p.agent_host.as_deref().unwrap_or("");
         self.conn.execute(
@@ -594,6 +715,25 @@ impl Database {
 
         match p.event.as_str() {
             "heartbeat" => {
+                // Un heartbeat reenviado (backlog) más viejo que el último
+                // aplicado no puede pisar el estado actual con datos antiguos.
+                let last_hb_ts: i64 = self.conn.query_row(
+                    "SELECT last_hb_ts FROM agents WHERE agent_id = ?1",
+                    params![p.agent_id],
+                    |r| r.get(0),
+                )?;
+                if ts < last_hb_ts {
+                    return Ok(IngestOutcome {
+                        id,
+                        duplicate: false,
+                    });
+                }
+                // Acotado a "ahora": un reloj del agente adelantado no debe
+                // dejar fuera los heartbeats siguientes.
+                self.conn.execute(
+                    "UPDATE agents SET last_hb_ts = ?1 WHERE agent_id = ?2",
+                    params![ts.min(now), p.agent_id],
+                )?;
                 // El heartbeat refleja el resumen agregado que el agente cree
                 // tener. Pero no debe ENMASCARAR una incidencia activa: si la
                 // central aún tiene fails sin recover para este agente, su
@@ -694,7 +834,10 @@ impl Database {
             _ => {} // otros eventos (p.ej. "ok") solo se almacenan
         }
 
-        Ok(id)
+        Ok(IngestOutcome {
+            id,
+            duplicate: false,
+        })
     }
 
     fn active_alerts_for_agent(&self, agent_id: &str) -> rusqlite::Result<i64> {
@@ -917,6 +1060,16 @@ fn map_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventRow> {
     })
 }
 
+/// ¿Existe la columna en la tabla? (para migraciones idempotentes)
+fn has_column(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+        params![table, column],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
 fn now_unix() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -955,6 +1108,7 @@ mod tests {
             warn_count: None,
             critical_count: None,
             checks: vec![],
+            event_id: None,
         }
     }
 

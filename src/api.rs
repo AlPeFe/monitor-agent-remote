@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, Request, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
@@ -49,7 +49,12 @@ struct IngestResponse {
     ok: bool,
     stored: i64,
     agent_id: String,
+    /// true si el (agent_id, event_id) ya se había recibido: no se reprocesa.
+    duplicate: bool,
 }
+
+/// Máximo de eventos por petición en /api/ingest/batch.
+const MAX_BATCH: usize = 500;
 
 pub fn router(
     db: Arc<Mutex<Database>>,
@@ -82,6 +87,12 @@ pub fn router(
     Router::new()
         .route("/", get(index_handler))
         .route("/api/ingest", post(ingest_handler))
+        // Un lote de 500 heartbeats con inventario supera el límite de 2 MB
+        // por defecto de axum.
+        .route(
+            "/api/ingest/batch",
+            post(ingest_batch_handler).layer(DefaultBodyLimit::max(32 * 1024 * 1024)),
+        )
         .route("/api/agents", get(agents_handler))
         .route("/api/agents/{agent_id}/events", get(agent_events_handler))
         .route("/api/agents/{agent_id}/checks", get(agent_checks_handler))
@@ -122,24 +133,33 @@ async fn index_handler() -> impl IntoResponse {
     ([("Cache-Control", "no-store")], Html(INDEX_HTML))
 }
 
+/// Token del ingest: None si está autorizado, la respuesta 401 si no.
+async fn check_ingest_auth(
+    state: &ApiState,
+    headers: &HeaderMap,
+) -> Option<(StatusCode, Json<Value>)> {
+    let expected = state.settings.read().await.token.clone()?;
+    let provided = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if provided != format!("Bearer {expected}") {
+        return Some((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "ok": false, "error": "unauthorized" })),
+        ));
+    }
+    None
+}
+
 /// POST /api/ingest — contrato del webhook de monitor-agent.
 async fn ingest_handler(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Json(payload): Json<IngestPayload>,
 ) -> (StatusCode, Json<Value>) {
-    let expected = state.settings.read().await.token.clone();
-    if let Some(expected) = expected {
-        let provided = headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        if provided != format!("Bearer {expected}") {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(json!({ "ok": false, "error": "unauthorized" })),
-            );
-        }
+    if let Some(denied) = check_ingest_auth(&state, &headers).await {
+        return denied;
     }
     if payload.agent_id.trim().is_empty() || payload.event.trim().is_empty() {
         return (
@@ -150,16 +170,64 @@ async fn ingest_handler(
 
     let mut db = state.db.lock().await;
     match db.ingest(&payload) {
-        Ok(stored) => (
+        Ok(out) => (
             StatusCode::OK,
             Json(
                 serde_json::to_value(IngestResponse {
                     ok: true,
-                    stored,
+                    stored: out.id,
                     agent_id: payload.agent_id,
+                    duplicate: out.duplicate,
                 })
                 .unwrap_or(json!({ "ok": true })),
             ),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "ok": false, "error": e.to_string() })),
+        ),
+    }
+}
+
+/// POST /api/ingest/batch — lista de payloads de /api/ingest (máx. 500),
+/// aplicados en orden en una sola transacción. Lo usa el agente para
+/// reenviar su backlog tras un corte. Todo o nada: si un elemento no es
+/// válido no se aplica ninguno.
+async fn ingest_batch_handler(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(payloads): Json<Vec<IngestPayload>>,
+) -> (StatusCode, Json<Value>) {
+    if let Some(denied) = check_ingest_auth(&state, &headers).await {
+        return denied;
+    }
+    if payloads.len() > MAX_BATCH {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({
+                "ok": false,
+                "error": format!("batch too large: {} events (max {MAX_BATCH})", payloads.len())
+            })),
+        );
+    }
+    if let Some(i) = payloads
+        .iter()
+        .position(|p| p.agent_id.trim().is_empty() || p.event.trim().is_empty())
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "error": format!("item {i}: agent_id and event are required")
+            })),
+        );
+    }
+
+    let mut db = state.db.lock().await;
+    match db.ingest_batch(&payloads) {
+        Ok((stored, duplicates)) => (
+            StatusCode::OK,
+            Json(json!({ "ok": true, "stored": stored, "duplicates": duplicates })),
         ),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
