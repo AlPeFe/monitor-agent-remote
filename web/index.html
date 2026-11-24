@@ -729,7 +729,8 @@ tr.uptime-row td { padding-top: 0; font-family: var(--ui); }
       var cell = el('i', bucketClass(b));
       var desde = new Date(b.hour_ts * 1000);
       var txt = desde.toLocaleDateString() + ' ' + desde.getHours() + ':00 · ';
-      txt += b.total ? (b.ok + '/' + b.total + ' ok' + (b.worst && b.worst !== 'ok' ? ' · peor: ' + b.worst : '')) : 'sin datos';
+      if (b.total) txt += b.ok + '/' + b.total + ' ok' + (b.worst && b.worst !== 'ok' ? ' · peor: ' + b.worst : '');
+      else txt += b.no_data ? 'sin datos (el servidor no envió heartbeats)' : 'sin muestras de este check';
       cell.title = txt;
       bar.appendChild(cell);
     });
@@ -746,7 +747,10 @@ tr.uptime-row td { padding-top: 0; font-family: var(--ui); }
       var pill = el('span');
       pill.appendChild(el('span', 'lbl', r[1]));
       pill.appendChild(el('b', pctClass(range.pct), range.pct == null ? '—' : range.pct.toFixed(2) + '%'));
-      pill.title = range.total ? (range.ok + '/' + range.total + ' muestras ok') : 'sin muestras';
+      // Horas sin heartbeat: no cuentan en el %, pero se enseñan al lado.
+      if (range.no_data_hours > 0) pill.appendChild(el('span', 'nd', '· ' + range.no_data_hours + ' h sin datos'));
+      pill.title = (range.total ? (range.ok + '/' + range.total + ' muestras ok') : 'sin muestras') +
+        (range.no_data_hours > 0 ? ' · ' + range.no_data_hours + ' h sin heartbeats (fuera del %)' : '');
       pcts.appendChild(pill);
     });
     line.appendChild(pcts);

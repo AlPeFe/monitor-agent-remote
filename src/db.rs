@@ -189,6 +189,9 @@ pub struct UptimeRange {
     pub pct: Option<f64>,
     pub total: i64,
     pub ok: i64,
+    /// Horas del rango en las que el agente no mandó ningún heartbeat
+    /// (servidor caído o sin red). No cuentan en `pct`.
+    pub no_data_hours: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -210,6 +213,8 @@ pub struct HourBucket {
     pub total: i64,
     pub ok: i64,
     pub worst: Option<String>,
+    /// Hora sin ningún heartbeat del agente desde que hay historial.
+    pub no_data: bool,
 }
 
 /// Incidencia fail -> recover de un check (end = None: sigue abierta).
@@ -241,7 +246,24 @@ pub struct AgentUptime {
     pub now: i64,
     /// Inicio de la hora actual (último cubo de `hours`).
     pub hour_ts: i64,
+    /// Primera hora desde la que se cuentan las horas sin datos (None: el
+    /// agente aún no tiene historial).
+    pub history_start: Option<i64>,
+    /// Horas sin heartbeat del agente por rango (las mismas que en cada check).
+    pub no_data_hours: NoDataHours,
     pub checks: Vec<CheckUptime>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Default)]
+pub struct NoDataHours {
+    #[serde(rename = "24h")]
+    pub h24: i64,
+    #[serde(rename = "7d")]
+    pub d7: i64,
+    #[serde(rename = "30d")]
+    pub d30: i64,
+    #[serde(rename = "365d")]
+    pub d365: i64,
 }
 
 /// Horas de la barra de estado.
@@ -1182,23 +1204,66 @@ impl Database {
     /// las últimas 48 horas e incidencias fail -> recover. None si el agente
     /// no existe.
     pub fn agent_uptime(&self, agent_id: &str, now: i64) -> rusqlite::Result<Option<AgentUptime>> {
-        let exists: Option<i64> = self
+        let Some(first_seen) = self
             .conn
             .query_row(
                 "SELECT first_seen FROM agents WHERE agent_id = ?1",
                 params![agent_id],
-                |r| r.get(0),
+                |r| r.get::<_, i64>(0),
             )
-            .optional()?;
-        if exists.is_none() {
+            .optional()?
+        else {
             return Ok(None);
-        }
+        };
 
         let cur = hour_floor(now);
         // Inicio de cada rango: N cubos contando la hora actual (parcial).
         let start = |hours: i64| cur - (hours - 1) * 3600;
         let (s24, s7, s30, s365) = (start(24), start(24 * 7), start(24 * 30), start(24 * 365));
         let bar_start = start(UPTIME_BAR_HOURS);
+
+        // Horas sin datos: horas sin fila en agent_hourly desde que el agente
+        // tiene historial. Se cuenta desde su primera hora con heartbeats (o
+        // desde first_seen si aún no tiene ninguna): en una central que se
+        // actualiza, los agentes ya existentes tienen first_seen de hace
+        // meses pero historial desde hoy, y no serían "horas sin datos".
+        let first_hour: Option<i64> = self.conn.query_row(
+            "SELECT MIN(hour_ts) FROM agent_hourly WHERE agent_id = ?1",
+            params![agent_id],
+            |r| r.get(0),
+        )?;
+        let history_start = first_hour.or(if first_seen > 0 {
+            Some(hour_floor(first_seen))
+        } else {
+            None
+        });
+        // Horas del agente con heartbeat en los últimos 365 días.
+        let present: std::collections::HashSet<i64> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT hour_ts FROM agent_hourly
+                 WHERE agent_id = ?1 AND hour_ts >= ?2 AND hour_ts <= ?3",
+            )?;
+            stmt.query_map(params![agent_id, s365, cur], |r| r.get::<_, i64>(0))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        let no_data_since = |range_start: i64| -> i64 {
+            let Some(hs) = history_start else { return 0 };
+            let from = range_start.max(hs);
+            if from > cur {
+                return 0;
+            }
+            let expected = (cur - from) / 3600 + 1;
+            let seen = present.iter().filter(|h| **h >= from).count() as i64;
+            (expected - seen).max(0)
+        };
+        let no_data_hours = NoDataHours {
+            h24: no_data_since(s24),
+            d7: no_data_since(s7),
+            d30: no_data_since(s30),
+            d365: no_data_since(s365),
+        };
+        let is_no_data =
+            |hour_ts: i64| history_start.is_some_and(|hs| hour_ts >= hs) && !present.contains(&hour_ts);
 
         type Key = (String, String);
         let mut checks: std::collections::BTreeMap<Key, CheckUptime> = Default::default();
@@ -1210,13 +1275,34 @@ impl Database {
                 .or_insert_with(|| CheckUptime {
                     check_type,
                     target,
-                    uptime: UptimeRanges::default(),
+                    uptime: UptimeRanges {
+                        h24: UptimeRange {
+                            no_data_hours: no_data_hours.h24,
+                            ..Default::default()
+                        },
+                        d7: UptimeRange {
+                            no_data_hours: no_data_hours.d7,
+                            ..Default::default()
+                        },
+                        d30: UptimeRange {
+                            no_data_hours: no_data_hours.d30,
+                            ..Default::default()
+                        },
+                        d365: UptimeRange {
+                            no_data_hours: no_data_hours.d365,
+                            ..Default::default()
+                        },
+                    },
                     hours: (0..UPTIME_BAR_HOURS)
-                        .map(|i| HourBucket {
-                            hour_ts: bar_start + i * 3600,
-                            total: 0,
-                            ok: 0,
-                            worst: None,
+                        .map(|i| {
+                            let hour_ts = bar_start + i * 3600;
+                            HourBucket {
+                                hour_ts,
+                                total: 0,
+                                ok: 0,
+                                worst: None,
+                                no_data: is_no_data(hour_ts),
+                            }
                         })
                         .collect(),
                     incidents: Vec::new(),
@@ -1237,7 +1323,9 @@ impl Database {
             }
         }
 
-        // Porcentajes: sumas por rango en una sola pasada.
+        // Porcentajes: sumas por rango en una sola pasada. Las horas sin
+        // datos no tienen filas en check_hourly, así que ya quedan fuera del
+        // denominador.
         {
             let mut stmt = self.conn.prepare(
                 "SELECT check_type, target,
@@ -1268,16 +1356,17 @@ impl Database {
                 let (ct, t, sums) = row?;
                 entry(&mut checks, ct.clone(), t.clone());
                 let c = checks.get_mut(&(ct, t)).expect("entrada recién creada");
-                let r = |(total, ok): (i64, i64)| UptimeRange {
+                let r = |(total, ok): (i64, i64), no_data_hours: i64| UptimeRange {
                     pct: uptime_pct(ok, total),
                     total,
                     ok,
+                    no_data_hours,
                 };
                 c.uptime = UptimeRanges {
-                    h24: r(sums[0]),
-                    d7: r(sums[1]),
-                    d30: r(sums[2]),
-                    d365: r(sums[3]),
+                    h24: r(sums[0], no_data_hours.h24),
+                    d7: r(sums[1], no_data_hours.d7),
+                    d30: r(sums[2], no_data_hours.d30),
+                    d365: r(sums[3], no_data_hours.d365),
                 };
             }
         }
@@ -1381,6 +1470,8 @@ impl Database {
             agent_id: agent_id.to_string(),
             now,
             hour_ts: cur,
+            history_start,
+            no_data_hours,
             checks: checks.into_values().collect(),
         }))
     }

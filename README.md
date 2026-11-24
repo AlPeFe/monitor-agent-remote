@@ -144,14 +144,22 @@ muestras llegaron en cada hora y cuántas estaban en `ok` (hora del
 `timestamp` del heartbeat). Se conservan `retention.history_days` días.
 
 `GET /api/agents/{id}/uptime` devuelve `404` si el agente no existe y, si no,
-`{agent_id, now, hour_ts, checks: [...]}`. Cada check trae:
+`{agent_id, now, hour_ts, history_start, no_data_hours, checks: [...]}`.
+Cada check trae:
 
 - `uptime`: objetos `24h`, `7d`, `30d` y `365d` con `pct` (ok/total en %,
-  truncado a 2 decimales; `null` si no hay muestras), `total` y `ok`. Cada
-  rango cuenta la hora actual, aunque esté a medias.
+  truncado a 2 decimales; `null` si no hay muestras), `total`, `ok` y
+  `no_data_hours`. Cada rango cuenta la hora actual, aunque esté a medias.
 - `hours`: las últimas 48 horas, de la más antigua a la actual, con
-  `hour_ts`, `total`, `ok` y `worst` (peor estado de la hora, `null` sin
-  muestras).
+  `hour_ts`, `total`, `ok`, `worst` (peor estado de la hora, `null` sin
+  muestras) y `no_data`.
+
+Una hora "sin datos" es una hora en la que el agente no mandó ningún
+heartbeat (servidor apagado, servicio parado, sin red). Se cuentan desde la
+primera hora con historial del agente (`history_start`; si aún no tiene,
+desde `first_seen`). No entran en el porcentaje: se devuelven aparte en
+`no_data_hours` y el panel las pinta en gris y como "3 h sin datos" junto al
+porcentaje.
 - `incidents`: hasta 50 pares fail → recover sacados de `events`, la más
   reciente primero, con `start`, `end` (`null` si sigue abierta),
   `duration_seconds` (hasta ahora si sigue abierta), `status` y `message`.
